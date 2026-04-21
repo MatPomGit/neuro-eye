@@ -1,0 +1,12 @@
+name: eye-tracking-research
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - PyQt6>=6.6
+      - opencv-python>=4.9
+      - mediapipe>=0.10
+      - numpy>=1.26
+      - pyyaml>=6.0
