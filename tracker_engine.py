@@ -1,688 +1,452 @@
-"""Tracking backend for the modular eye-tracking research application.
+"""Runtime tracking backend for the eye-tracking research application.
 
-This module provides the backend contract expected by ``main.py``:
-- ``TrackerController`` as the GUI-facing facade.
-- ``CameraWorker`` running in a ``QThread`` to keep the UI responsive.
-- A practical blink detector based on eye-aspect-ratio style features.
-- A fullscreen 9-point calibration window and session manager.
-- YAML calibration persistence and CSV/JSON recording export helpers.
+This module keeps the GUI-facing contract small and stable:
+- ``TrackerController`` is the facade used by ``main.py``.
+- ``CameraThread`` handles webcam capture off the UI thread.
+- ``BlinkDetector`` implements a practical EAR-based blink detector.
+- Calibration, fullscreen presentation, and persistence are imported from the
+  dedicated project modules instead of being duplicated here.
 
-The implementation is intentionally robust to partially missing runtime
-dependencies. If OpenCV or MediaPipe are unavailable, the module still exposes a
-working interface and degrades gracefully with informative status messages.
+The implementation degrades safely when optional dependencies such as OpenCV or
+MediaPipe are unavailable.
 """
 
 from __future__ import annotations
 
-import csv
-import json
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import numpy as np
-import yaml
-from PyQt6.QtCore import QMutex, QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QImage
+from PyQt6.QtWidgets import QApplication, QWidget
 
-try:
+from calibration import CalibrationData, CalibrationModel, CalibrationSample
+from data_io import CalibrationStorage, RecordingWriter
+from widgets.calibration_window import CalibrationWindow
+
+try:  # pragma: no cover - optional runtime dependency
     import cv2
-except ImportError:  # pragma: no cover - environment dependent
+except Exception:  # pragma: no cover - optional runtime dependency
     cv2 = None
 
-try:
+try:  # pragma: no cover - optional runtime dependency
     import mediapipe as mp
-except ImportError:  # pragma: no cover - environment dependent
+except Exception:  # pragma: no cover - optional runtime dependency
     mp = None
 
 
-DEFAULT_CAMERA_INDEX = 0
-DEFAULT_CAMERA_RESOLUTION = (1280, 720)
-DEFAULT_CAMERA_FPS = 30.0
-LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
-LEFT_IRIS_INDICES = [468, 469, 470, 471, 472]
-RIGHT_IRIS_INDICES = [473, 474, 475, 476, 477]
-NOSE_TIP_INDEX = 1
-CHIN_INDEX = 152
-FOREHEAD_INDEX = 10
-LEFT_TEMPLE_INDEX = 234
-RIGHT_TEMPLE_INDEX = 454
+LEFT_EYE_EAR = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_EAR = [362, 385, 387, 263, 373, 380]
+LEFT_IRIS = [468, 469, 470, 471, 472]
+RIGHT_IRIS = [473, 474, 475, 476, 477]
+LEFT_EYE_BOX = {"outer": 33, "inner": 133, "top": 159, "bottom": 145}
+RIGHT_EYE_BOX = {"outer": 263, "inner": 362, "top": 386, "bottom": 374}
+HEAD_POSE_REF = {"left": 33, "right": 263, "nose": 1, "mid": 168}
 
 
 @dataclass(slots=True)
-class FrameMetrics:
-    """Single-frame telemetry emitted to the GUI and recorder."""
+class BlinkEvent:
+    """One completed blink event."""
 
-    timestamp: str
-    gaze_x: float = 0.0
-    gaze_y: float = 0.0
-    pupil_dilation: float = 0.0
-    blink_rate: float = 0.0
-    tracking_ready: bool = False
-    blink_detected: bool = False
-    head_yaw: float = 0.0
-    head_pitch: float = 0.0
-    raw_feature_vector: list[float] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class CalibrationSample:
-    """Collected sample for one calibration point."""
-
-    target_x: float
-    target_y: float
-    features: list[float]
-    timestamp: str
-
-
-@dataclass(slots=True)
-class CalibrationData:
-    """Persisted calibration model."""
-
-    timestamp: str
-    camera_resolution: list[int]
-    feature_names: list[str]
-    model_type: str
-    transformation_matrix: list[list[float]]
-    target_layout: list[list[float]]
-    validation_error_px: Optional[float] = None
-
-
-class CalibrationStorage:
-    """Read and write calibration data in YAML format."""
-
-    @staticmethod
-    def save(path: str | Path, payload: CalibrationData) -> None:
-        file_path = Path(path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(asdict(payload), handle, sort_keys=False)
-
-    @staticmethod
-    def load(path: str | Path) -> dict[str, Any]:
-        file_path = Path(path)
-        with file_path.open("r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
-        return data
-
-
-class RecordingWriter:
-    """Buffered gaze recording export supporting CSV and JSON."""
-
-    def __init__(self) -> None:
-        self._is_recording = False
-        self._session_name = ""
-        self._export_path: Optional[Path] = None
-        self._rows: list[dict[str, Any]] = []
-
-    @property
-    def is_recording(self) -> bool:
-        return self._is_recording
-
-    def start(self, session_name: str, export_path: str | None = None) -> str:
-        self._session_name = session_name
-        if export_path:
-            self._export_path = Path(export_path)
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._export_path = Path.cwd() / f"{session_name}_{timestamp}.csv"
-        self._rows = []
-        self._is_recording = True
-        return str(self._export_path)
-
-    def append(self, metrics: FrameMetrics) -> None:
-        if not self._is_recording:
-            return
-        row = asdict(metrics)
-        row["session_name"] = self._session_name
-        self._rows.append(row)
-
-    def stop(self) -> Optional[str]:
-        if not self._is_recording or self._export_path is None:
-            self._is_recording = False
-            return None
-
-        export_path = self._export_path
-        export_path.parent.mkdir(parents=True, exist_ok=True)
-        suffix = export_path.suffix.lower()
-
-        if suffix == ".json":
-            with export_path.open("w", encoding="utf-8") as handle:
-                json.dump(self._rows, handle, indent=2)
-        else:
-            fieldnames = list(self._rows[0].keys()) if self._rows else [
-                "session_name",
-                "timestamp",
-                "gaze_x",
-                "gaze_y",
-                "pupil_dilation",
-                "blink_rate",
-                "tracking_ready",
-                "blink_detected",
-                "head_yaw",
-                "head_pitch",
-                "raw_feature_vector",
-            ]
-            with export_path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(self._rows)
-
-        self._is_recording = False
-        self._rows = []
-        self._session_name = ""
-        self._export_path = None
-        return str(export_path)
+    start_ts: float
+    end_ts: float
+    duration_ms: float
+    min_ear: float
 
 
 class BlinkDetector:
-    """State-based blink detector using EAR-style thresholds with hysteresis."""
+    """Practical blink detector based on eye aspect ratio with hysteresis."""
 
     def __init__(
         self,
-        close_threshold: float = 0.21,
+        fps_hint: float = 30.0,
+        close_threshold: float = 0.20,
         open_threshold: float = 0.24,
-        min_consecutive_closed: int = 2,
-        min_blink_duration_ms: int = 80,
-        max_blink_duration_ms: int = 400,
-        refractory_ms: int = 120,
+        min_closed_frames: int = 2,
+        refractory_ms: float = 120.0,
     ) -> None:
+        self.fps_hint = fps_hint
         self.close_threshold = close_threshold
         self.open_threshold = open_threshold
-        self.min_consecutive_closed = min_consecutive_closed
-        self.min_blink_duration_ms = min_blink_duration_ms
-        self.max_blink_duration_ms = max_blink_duration_ms
+        self.min_closed_frames = min_closed_frames
         self.refractory_ms = refractory_ms
+        self._state = "OPEN"
         self._closed_frames = 0
-        self._is_blink_active = False
-        self._blink_start_ms: Optional[float] = None
-        self._last_blink_end_ms = 0.0
-        self._blink_timestamps_ms: list[float] = []
+        self._blink_start_ts: Optional[float] = None
+        self._last_blink_end_ts = 0.0
+        self._min_ear = 1.0
+        self._events: deque[float] = deque()
+        self._blink_active = False
 
-    @staticmethod
-    def _eye_aspect_ratio(points: np.ndarray) -> float:
-        if points.shape[0] < 6:
-            return 0.0
-        p1, p2, p3, p4, p5, p6 = points[:6]
-        vertical_a = np.linalg.norm(p2 - p6)
-        vertical_b = np.linalg.norm(p3 - p5)
-        horizontal = np.linalg.norm(p1 - p4)
-        if horizontal <= 1e-6:
-            return 0.0
-        return float((vertical_a + vertical_b) / (2.0 * horizontal))
+    @property
+    def blink_active(self) -> bool:
+        return self._blink_active
 
-    def update(self, left_eye: np.ndarray, right_eye: np.ndarray, head_pose_ok: bool) -> tuple[bool, float]:
-        now_ms = time.perf_counter() * 1000.0
-        left_ear = self._eye_aspect_ratio(left_eye)
-        right_ear = self._eye_aspect_ratio(right_eye)
-        avg_ear = (left_ear + right_ear) / 2.0
+    def blink_rate_bpm(self, now_ts: float) -> float:
+        while self._events and (now_ts - self._events[0]) > 60.0:
+            self._events.popleft()
+        return float(len(self._events))
 
-        if not head_pose_ok:
+    def update(self, avg_ear: float, quality_ok: bool, now_ts: float) -> Optional[BlinkEvent]:
+        self._blink_active = False
+
+        if not quality_ok:
+            self._state = "OPEN"
             self._closed_frames = 0
-            if self._is_blink_active:
-                self._is_blink_active = False
-            return False, self._blink_rate(now_ms)
+            self._blink_start_ts = None
+            self._min_ear = 1.0
+            return None
 
-        blink_detected = False
+        if self._state == "OPEN":
+            if avg_ear < self.close_threshold and (now_ts - self._last_blink_end_ts) * 1000.0 >= self.refractory_ms:
+                self._closed_frames += 1
+                self._min_ear = min(self._min_ear, avg_ear)
+                if self._closed_frames >= self.min_closed_frames:
+                    self._state = "CLOSED"
+                    self._blink_start_ts = now_ts
+                    self._blink_active = True
+            else:
+                self._closed_frames = 0
+                self._min_ear = 1.0
+            return None
 
-        if avg_ear < self.close_threshold:
-            self._closed_frames += 1
-            if (
-                not self._is_blink_active
-                and self._closed_frames >= self.min_consecutive_closed
-                and (now_ms - self._last_blink_end_ms) > self.refractory_ms
-            ):
-                self._is_blink_active = True
-                self._blink_start_ms = now_ms
-        elif avg_ear > self.open_threshold:
-            self._closed_frames = 0
-            if self._is_blink_active and self._blink_start_ms is not None:
-                duration_ms = now_ms - self._blink_start_ms
-                if self.min_blink_duration_ms <= duration_ms <= self.max_blink_duration_ms:
-                    blink_detected = True
-                    self._blink_timestamps_ms.append(now_ms)
-                self._is_blink_active = False
-                self._last_blink_end_ms = now_ms
-                self._blink_start_ms = None
-        else:
-            self._closed_frames = max(0, self._closed_frames - 1)
+        if self._state == "CLOSED":
+            self._blink_active = True
+            self._min_ear = min(self._min_ear, avg_ear)
+            if avg_ear > self.open_threshold:
+                start_ts = self._blink_start_ts or now_ts
+                duration_ms = max(0.0, (now_ts - start_ts) * 1000.0)
+                self._state = "OPEN"
+                self._closed_frames = 0
+                self._blink_start_ts = None
+                self._last_blink_end_ts = now_ts
+                self._events.append(now_ts)
+                event = BlinkEvent(
+                    start_ts=start_ts,
+                    end_ts=now_ts,
+                    duration_ms=duration_ms,
+                    min_ear=self._min_ear,
+                )
+                self._min_ear = 1.0
+                self._blink_active = False
+                return event
+            return None
 
-        return blink_detected, self._blink_rate(now_ms)
-
-    def _blink_rate(self, now_ms: float) -> float:
-        window_ms = 60_000.0
-        self._blink_timestamps_ms = [ts for ts in self._blink_timestamps_ms if now_ms - ts <= window_ms]
-        return float(len(self._blink_timestamps_ms))
-
-
-class CalibrationModel:
-    """Second-order polynomial calibration mapping eye features to screen space."""
-
-    FEATURE_NAMES = [
-        "left_iris_x",
-        "left_iris_y",
-        "right_iris_x",
-        "right_iris_y",
-        "head_yaw",
-        "head_pitch",
-    ]
-
-    def __init__(self) -> None:
-        self.coefficients: Optional[np.ndarray] = None
-        self.target_layout = self.default_target_layout()
-        self.validation_error_px: Optional[float] = None
-
-    @staticmethod
-    def default_target_layout() -> list[list[float]]:
-        return [
-            [0.1, 0.1], [0.5, 0.1], [0.9, 0.1],
-            [0.1, 0.5], [0.5, 0.5], [0.9, 0.5],
-            [0.1, 0.9], [0.5, 0.9], [0.9, 0.9],
-        ]
-
-    @staticmethod
-    def expand_features(features: Iterable[float]) -> np.ndarray:
-        f = np.asarray(list(features), dtype=np.float64)
-        if f.size != 6:
-            raise ValueError("Calibration model expects exactly 6 features.")
-        x1, x2, x3, x4, x5, x6 = f
-        return np.asarray(
-            [
-                1.0,
-                x1, x2, x3, x4, x5, x6,
-                x1 * x1, x2 * x2, x3 * x3, x4 * x4, x5 * x5, x6 * x6,
-                x1 * x2, x1 * x3, x1 * x4, x2 * x3, x2 * x4, x3 * x4,
-            ],
-            dtype=np.float64,
-        )
-
-    def fit(self, samples: list[CalibrationSample], screen_size: tuple[int, int]) -> CalibrationData:
-        if len(samples) < 9:
-            raise ValueError("At least 9 calibration samples are required.")
-
-        design = np.vstack([self.expand_features(sample.features) for sample in samples])
-        targets = np.asarray(
-            [[sample.target_x * screen_size[0], sample.target_y * screen_size[1]] for sample in samples],
-            dtype=np.float64,
-        )
-        coefficients, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
-        self.coefficients = coefficients
-
-        predictions = design @ coefficients
-        error = np.linalg.norm(predictions - targets, axis=1)
-        self.validation_error_px = float(np.mean(error))
-
-        return CalibrationData(
-            timestamp=datetime.now().isoformat(timespec="seconds"),
-            camera_resolution=[screen_size[0], screen_size[1]],
-            feature_names=self.FEATURE_NAMES,
-            model_type="polynomial_regression_order_2",
-            transformation_matrix=coefficients.tolist(),
-            target_layout=self.target_layout,
-            validation_error_px=self.validation_error_px,
-        )
-
-    def load_from_dict(self, payload: dict[str, Any]) -> None:
-        matrix = payload.get("transformation_matrix")
-        self.coefficients = np.asarray(matrix, dtype=np.float64) if matrix else None
-        self.validation_error_px = payload.get("validation_error_px")
-        self.target_layout = payload.get("target_layout", self.default_target_layout())
-
-    def map_to_screen(self, features: list[float], screen_size: tuple[int, int]) -> tuple[float, float, bool]:
-        if self.coefficients is None:
-            return 0.0, 0.0, False
-        expanded = self.expand_features(features)
-        output = expanded @ self.coefficients
-        width, height = screen_size
-        x = float(np.clip(output[0], 0, width))
-        y = float(np.clip(output[1], 0, height))
-        nx = x / max(width, 1)
-        ny = y / max(height, 1)
-        return nx, ny, True
+        self._state = "OPEN"
+        self._closed_frames = 0
+        self._blink_start_ts = None
+        self._min_ear = 1.0
+        return None
 
 
-class CalibrationWindow(QWidget):
-    """Fullscreen target presenter for the 9-point calibration routine."""
-
-    calibration_finished = pyqtSignal(list)
-    status_message = pyqtSignal(str)
-
-    def __init__(self, controller: "TrackerController") -> None:
-        super().__init__()
-        self.controller = controller
-        self.points = CalibrationModel.default_target_layout()
-        self.current_index = -1
-        self.collecting = False
-        self.collected_samples: list[CalibrationSample] = []
-        self._point_samples: list[list[float]] = []
-        self._settle_timer = QTimer(self)
-        self._collect_timer = QTimer(self)
-        self._settle_timer.setSingleShot(True)
-        self._collect_timer.setSingleShot(True)
-        self._settle_timer.timeout.connect(self._begin_collection_phase)
-        self._collect_timer.timeout.connect(self._finalize_current_point)
-        self.setWindowTitle("Calibration")
-        self.setWindowFlag(Qt.WindowType.Window)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setCursor(Qt.CursorShape.BlankCursor)
-
-    def start(self) -> None:
-        self.collected_samples = []
-        self.current_index = -1
-        self.status_message.emit("Calibration started. Follow the fullscreen targets.")
-        self.showFullScreen()
-        self._advance_to_next_point()
-
-    def keyPressEvent(self, event: Any) -> None:  # noqa: N802
-        if event.key() == Qt.Key.Key_Escape:
-            self.status_message.emit("Calibration cancelled.")
-            self.close()
-            return
-        super().keyPressEvent(event)
-
-    def closeEvent(self, event: Any) -> None:  # noqa: N802
-        self._settle_timer.stop()
-        self._collect_timer.stop()
-        self.controller.unregister_calibration_window(self)
-        super().closeEvent(event)
-
-    def paintEvent(self, event: Any) -> None:  # noqa: N802
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("black"))
-
-        if 0 <= self.current_index < len(self.points):
-            px, py = self.points[self.current_index]
-            x = int(self.width() * px)
-            y = int(self.height() * py)
-            painter.setPen(QPen(QColor("white"), 3))
-            radius = 18
-            painter.drawEllipse(x - radius, y - radius, radius * 2, radius * 2)
-            painter.drawLine(x - 28, y, x + 28, y)
-            painter.drawLine(x, y - 28, x, y + 28)
-
-            progress_rect = QRectF(20.0, self.height() - 40.0, max(0.0, (self.current_index + 1) / len(self.points) * (self.width() - 40.0)), 12.0)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#2563EB"))
-            painter.drawRoundedRect(progress_rect, 6.0, 6.0)
-
-    def _advance_to_next_point(self) -> None:
-        self.current_index += 1
-        if self.current_index >= len(self.points):
-            self.status_message.emit("Calibration sample collection complete.")
-            self.calibration_finished.emit(self.collected_samples)
-            self.close()
-            return
-
-        self.collecting = False
-        self._point_samples = []
-        self.status_message.emit(f"Calibration point {self.current_index + 1}/9")
-        self.update()
-        self._settle_timer.start(650)
-
-    def _begin_collection_phase(self) -> None:
-        self.collecting = True
-        self.status_message.emit(f"Collecting point {self.current_index + 1}/9")
-        self._collect_timer.start(1000)
-
-    def push_feature_vector(self, features: list[float], quality_ok: bool) -> None:
-        if not self.collecting or not quality_ok:
-            return
-        self._point_samples.append(list(features))
-
-    def _finalize_current_point(self) -> None:
-        self.collecting = False
-        if not self._point_samples:
-            self.status_message.emit(
-                f"Point {self.current_index + 1}/9 had no valid samples. Retrying."
-            )
-            self._settle_timer.start(500)
-            return
-
-        features = np.median(np.asarray(self._point_samples, dtype=np.float64), axis=0).tolist()
-        target_x, target_y = self.points[self.current_index]
-        self.collected_samples.append(
-            CalibrationSample(
-                target_x=target_x,
-                target_y=target_y,
-                features=features,
-                timestamp=datetime.now().isoformat(timespec="seconds"),
-            )
-        )
-        self._advance_to_next_point()
-
-
-class CameraWorker(QObject):
-    """Background worker that captures frames and computes gaze telemetry."""
+class CameraThread(QThread):
+    """Webcam processing thread with optional MediaPipe face mesh support."""
 
     frame_ready = pyqtSignal(QImage)
     metrics_ready = pyqtSignal(dict)
+    feature_vector_ready = pyqtSignal(list, bool)
     status_changed = pyqtSignal(str)
-    finished = pyqtSignal()
 
-    def __init__(self, camera_index: int = DEFAULT_CAMERA_INDEX) -> None:
-        super().__init__()
+    def __init__(self, camera_index: int = 0, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
         self.camera_index = camera_index
         self._running = False
-        self._mutex = QMutex()
-        self.blink_detector = BlinkDetector()
-        self._screen_size = self._current_screen_size()
+        self._screen_size = (1920, 1080)
         self._calibration_model = CalibrationModel()
+        self._blink_detector = BlinkDetector()
+        self._last_valid_features: Optional[list[float]] = None
+        self._last_metrics: dict[str, Any] = {}
 
     def stop(self) -> None:
-        self._mutex.lock()
         self._running = False
-        self._mutex.unlock()
+        self.wait(1500)
 
-    def update_calibration_model(self, model: CalibrationModel) -> None:
-        self._calibration_model = model
+    def set_screen_size(self, width: int, height: int) -> None:
+        self._screen_size = (max(width, 1), max(height, 1))
 
-    def run(self) -> None:
-        self._mutex.lock()
+    def set_calibration_payload(self, payload: dict[str, Any]) -> None:
+        self._calibration_model.load_from_dict(payload)
+
+    def run(self) -> None:  # pragma: no cover - runtime loop
         self._running = True
-        self._mutex.unlock()
 
         if cv2 is None:
-            self.status_changed.emit("OpenCV not available. Camera stream cannot start.")
-            self.finished.emit()
+            self.status_changed.emit("OpenCV not available. Running without camera feed.")
+            self._run_placeholder_loop()
             return
 
-        cap = cv2.VideoCapture(self.camera_index)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_CAMERA_RESOLUTION[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_CAMERA_RESOLUTION[1])
-        cap.set(cv2.CAP_PROP_FPS, DEFAULT_CAMERA_FPS)
-
-        if not cap.isOpened():
-            self.status_changed.emit("Unable to open camera device.")
-            self.finished.emit()
+        capture = cv2.VideoCapture(self.camera_index)
+        if not capture.isOpened():
+            self.status_changed.emit("Could not open camera. Running without live feed.")
+            self._run_placeholder_loop()
             return
 
-        if mp is None:
-            self.status_changed.emit("MediaPipe not available. Running preview-only camera mode.")
-            self._run_preview_only(cap)
-            return
+        self.status_changed.emit("Camera thread started.")
 
-        face_mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+        face_mesh = None
+        if mp is not None:
+            try:
+                face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+            except Exception:
+                face_mesh = None
+
+        try:
+            while self._running:
+                ok, frame_bgr = capture.read()
+                if not ok:
+                    self.status_changed.emit("Camera frame read failed.")
+                    time.sleep(0.05)
+                    continue
+
+                frame_bgr = cv2.flip(frame_bgr, 1)
+                metrics, annotated_rgb = self._process_frame(frame_bgr, face_mesh)
+                self._last_metrics = metrics
+                self.metrics_ready.emit(metrics)
+                self.frame_ready.emit(self._rgb_to_qimage(annotated_rgb))
+                self.feature_vector_ready.emit(
+                    list(metrics.get("feature_vector", [])),
+                    bool(metrics.get("quality_ok", False)),
+                )
+                self.msleep(10)
+        finally:
+            capture.release()
+            if face_mesh is not None:
+                face_mesh.close()
+            self.status_changed.emit("Camera thread stopped.")
+
+    def _run_placeholder_loop(self) -> None:  # pragma: no cover - runtime loop
+        while self._running:
+            image = QImage(1280, 720, QImage.Format.Format_RGB888)
+            image.fill(Qt.GlobalColor.black)
+            self.frame_ready.emit(image)
+            metrics = {
+                "gaze_x": 0.0,
+                "gaze_y": 0.0,
+                "pupil_dilation": 0.0,
+                "blink_rate": self._blink_detector.blink_rate_bpm(time.time()),
+                "tracking_ready": False,
+                "blink_detected": False,
+                "quality_ok": False,
+                "feature_vector": [],
+                "head_pose_ok": False,
+                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            }
+            self.metrics_ready.emit(metrics)
+            self.feature_vector_ready.emit([], False)
+            self.msleep(100)
+
+    def _process_frame(self, frame_bgr: np.ndarray, face_mesh: Any) -> tuple[dict[str, Any], np.ndarray]:
+        now_ts = time.time()
+        height, width = frame_bgr.shape[:2]
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        metrics: dict[str, Any] = {
+            "gaze_x": 0.0,
+            "gaze_y": 0.0,
+            "pupil_dilation": 0.0,
+            "blink_rate": self._blink_detector.blink_rate_bpm(now_ts),
+            "tracking_ready": False,
+            "blink_detected": False,
+            "quality_ok": False,
+            "feature_vector": [],
+            "head_pose_ok": False,
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+        }
+
+        if face_mesh is None:
+            cv2.putText(
+                frame_rgb,
+                "MediaPipe unavailable - camera preview only",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return metrics, frame_rgb
+
+        results = face_mesh.process(frame_rgb)
+        if not results.multi_face_landmarks:
+            cv2.putText(
+                frame_rgb,
+                "No face detected",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return metrics, frame_rgb
+
+        landmarks = results.multi_face_landmarks[0].landmark
+        points = np.asarray([(lm.x * width, lm.y * height) for lm in landmarks], dtype=np.float64)
+
+        left_ear = self._compute_ear(points, LEFT_EYE_EAR)
+        right_ear = self._compute_ear(points, RIGHT_EYE_EAR)
+        avg_ear = (left_ear + right_ear) * 0.5
+        head_yaw, head_pitch, head_pose_ok = self._estimate_head_pose(points, width, height)
+        blink_event = self._blink_detector.update(avg_ear, head_pose_ok, now_ts)
+
+        feature_vector, pupil_dilation, quality_ok = self._extract_feature_vector(points)
+        tracking_ready = False
+        gaze_x = 0.0
+        gaze_y = 0.0
+        if quality_ok:
+            self._last_valid_features = feature_vector
+            gaze_x, gaze_y, tracking_ready = self._calibration_model.map_to_screen(
+                feature_vector,
+                self._screen_size,
+            )
+
+        metrics.update(
+            {
+                "gaze_x": gaze_x,
+                "gaze_y": gaze_y,
+                "pupil_dilation": pupil_dilation,
+                "blink_rate": self._blink_detector.blink_rate_bpm(now_ts),
+                "tracking_ready": tracking_ready,
+                "blink_detected": self._blink_detector.blink_active,
+                "quality_ok": quality_ok and head_pose_ok and not self._blink_detector.blink_active,
+                "feature_vector": feature_vector,
+                "head_pose_ok": head_pose_ok,
+                "head_yaw": head_yaw,
+                "head_pitch": head_pitch,
+                "left_ear": left_ear,
+                "right_ear": right_ear,
+                "avg_ear": avg_ear,
+                "blink_duration_ms": blink_event.duration_ms if blink_event else 0.0,
+            }
         )
 
-        self.status_changed.emit("Camera worker started.")
-        try:
-            while self._is_running():
-                ok, frame = cap.read()
-                if not ok:
-                    self.status_changed.emit("Camera frame read failed.")
-                    break
-                image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = face_mesh.process(image_rgb)
-                metrics = self._build_metrics(image_rgb, results)
-                rendered = self._draw_overlay(image_rgb.copy(), results, metrics)
-                self.frame_ready.emit(self._to_qimage(rendered))
-                self.metrics_ready.emit(asdict(metrics))
-        finally:
-            face_mesh.close()
-            cap.release()
-            self.status_changed.emit("Camera worker stopped.")
-            self.finished.emit()
-
-    def _run_preview_only(self, cap: Any) -> None:
-        try:
-            while self._is_running():
-                ok, frame = cap.read()
-                if not ok:
-                    self.status_changed.emit("Camera frame read failed.")
-                    break
-                image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                metrics = FrameMetrics(timestamp=datetime.now().isoformat(timespec="milliseconds"))
-                self.frame_ready.emit(self._to_qimage(image_rgb))
-                self.metrics_ready.emit(asdict(metrics))
-        finally:
-            cap.release()
-            self.finished.emit()
-
-    def _build_metrics(self, image_rgb: np.ndarray, results: Any) -> FrameMetrics:
-        timestamp = datetime.now().isoformat(timespec="milliseconds")
-        metrics = FrameMetrics(timestamp=timestamp)
-        if not results.multi_face_landmarks:
-            return metrics
-
-        face_landmarks = results.multi_face_landmarks[0]
-        points = self._landmarks_to_pixels(face_landmarks, image_rgb.shape[1], image_rgb.shape[0])
-        left_eye = points[LEFT_EYE_INDICES]
-        right_eye = points[RIGHT_EYE_INDICES]
-        left_iris = points[LEFT_IRIS_INDICES]
-        right_iris = points[RIGHT_IRIS_INDICES]
-
-        head_yaw, head_pitch = self._estimate_head_pose(points)
-        head_pose_ok = abs(head_yaw) < 18.0 and abs(head_pitch) < 18.0
-        blink_detected, blink_rate = self.blink_detector.update(left_eye, right_eye, head_pose_ok)
-        features = self._extract_feature_vector(left_eye, right_eye, left_iris, right_iris, head_yaw, head_pitch)
-        gaze_x, gaze_y, tracking_ready = self._calibration_model.map_to_screen(features, self._screen_size)
-        pupil_dilation = self._estimate_pupil_dilation(left_iris, right_iris)
-
-        return FrameMetrics(
-            timestamp=timestamp,
+        self._annotate_frame(
+            frame_rgb=frame_rgb,
+            points=points,
+            left_ear=left_ear,
+            right_ear=right_ear,
+            quality_ok=bool(metrics["quality_ok"]),
+            gaze_ready=tracking_ready,
             gaze_x=gaze_x,
             gaze_y=gaze_y,
-            pupil_dilation=pupil_dilation,
-            blink_rate=blink_rate,
-            tracking_ready=tracking_ready,
-            blink_detected=blink_detected,
-            head_yaw=head_yaw,
-            head_pitch=head_pitch,
-            raw_feature_vector=features,
         )
+        return metrics, frame_rgb
 
     @staticmethod
-    def _landmarks_to_pixels(face_landmarks: Any, width: int, height: int) -> np.ndarray:
-        coords = []
-        for landmark in face_landmarks.landmark:
-            coords.append([landmark.x * width, landmark.y * height])
-        return np.asarray(coords, dtype=np.float64)
-
-    @staticmethod
-    def _estimate_head_pose(points: np.ndarray) -> tuple[float, float]:
-        left = points[LEFT_TEMPLE_INDEX]
-        right = points[RIGHT_TEMPLE_INDEX]
-        nose = points[NOSE_TIP_INDEX]
-        forehead = points[FOREHEAD_INDEX]
-        chin = points[CHIN_INDEX]
-
-        head_width = np.linalg.norm(right - left)
-        head_height = np.linalg.norm(chin - forehead)
-        if head_width <= 1e-6 or head_height <= 1e-6:
-            return 0.0, 0.0
-
-        center_x = (left[0] + right[0]) / 2.0
-        center_y = (forehead[1] + chin[1]) / 2.0
-        yaw = ((nose[0] - center_x) / head_width) * 90.0
-        pitch = ((nose[1] - center_y) / head_height) * 90.0
-        return float(yaw), float(pitch)
-
-    @staticmethod
-    def _extract_feature_vector(
-        left_eye: np.ndarray,
-        right_eye: np.ndarray,
-        left_iris: np.ndarray,
-        right_iris: np.ndarray,
-        head_yaw: float,
-        head_pitch: float,
-    ) -> list[float]:
-        def iris_relative(eye: np.ndarray, iris: np.ndarray) -> tuple[float, float]:
-            min_xy = eye.min(axis=0)
-            max_xy = eye.max(axis=0)
-            iris_center = iris.mean(axis=0)
-            width = max(max_xy[0] - min_xy[0], 1e-6)
-            height = max(max_xy[1] - min_xy[1], 1e-6)
-            rel_x = float((iris_center[0] - min_xy[0]) / width)
-            rel_y = float((iris_center[1] - min_xy[1]) / height)
-            return rel_x, rel_y
-
-        l_ix, l_iy = iris_relative(left_eye, left_iris)
-        r_ix, r_iy = iris_relative(right_eye, right_iris)
-        return [l_ix, l_iy, r_ix, r_iy, float(head_yaw), float(head_pitch)]
-
-    @staticmethod
-    def _estimate_pupil_dilation(left_iris: np.ndarray, right_iris: np.ndarray) -> float:
-        def iris_radius(iris: np.ndarray) -> float:
-            center = iris.mean(axis=0)
-            return float(np.mean(np.linalg.norm(iris - center, axis=1)))
-
-        return float((iris_radius(left_iris) + iris_radius(right_iris)) / 2.0)
-
-    @staticmethod
-    def _draw_overlay(image_rgb: np.ndarray, results: Any, metrics: FrameMetrics) -> np.ndarray:
-        if cv2 is None:
-            return image_rgb
-        output = image_rgb
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0]
-            height, width = output.shape[:2]
-            for index in LEFT_EYE_INDICES + RIGHT_EYE_INDICES + LEFT_IRIS_INDICES + RIGHT_IRIS_INDICES:
-                landmark = face_landmarks.landmark[index]
-                x = int(landmark.x * width)
-                y = int(landmark.y * height)
-                cv2.circle(output, (x, y), 2, (0, 255, 0), -1)
-
-        if metrics.tracking_ready:
-            gx = int(metrics.gaze_x * output.shape[1])
-            gy = int(metrics.gaze_y * output.shape[0])
-            cv2.drawMarker(output, (gx, gy), (255, 0, 0), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-        return output
-
-    @staticmethod
-    def _to_qimage(image_rgb: np.ndarray) -> QImage:
-        height, width, channels = image_rgb.shape
+    def _rgb_to_qimage(frame_rgb: np.ndarray) -> QImage:
+        height, width, channels = frame_rgb.shape
         bytes_per_line = channels * width
-        qimage = QImage(image_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
-        return qimage.copy()
+        image = QImage(
+            frame_rgb.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format.Format_RGB888,
+        )
+        return image.copy()
 
     @staticmethod
-    def _current_screen_size() -> tuple[int, int]:
-        screen = QGuiApplication.primaryScreen()
-        if screen is None:
-            return 1920, 1080
-        geometry = screen.availableGeometry()
-        return geometry.width(), geometry.height()
+    def _compute_ear(points: np.ndarray, idx: list[int]) -> float:
+        p1, p2, p3, p4, p5, p6 = [points[i] for i in idx]
+        vertical = np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5)
+        horizontal = max(np.linalg.norm(p1 - p4), 1e-6)
+        return float(vertical / (2.0 * horizontal))
 
-    def _is_running(self) -> bool:
-        self._mutex.lock()
-        value = self._running
-        self._mutex.unlock()
-        return value
+    @staticmethod
+    def _mean_point(points: np.ndarray, indices: list[int]) -> np.ndarray:
+        return np.mean(points[indices], axis=0)
+
+    def _extract_feature_vector(self, points: np.ndarray) -> tuple[list[float], float, bool]:
+        left_iris = self._mean_point(points, LEFT_IRIS)
+        right_iris = self._mean_point(points, RIGHT_IRIS)
+
+        left_width = max(np.linalg.norm(points[LEFT_EYE_BOX["outer"]] - points[LEFT_EYE_BOX["inner"]]), 1e-6)
+        left_height = max(np.linalg.norm(points[LEFT_EYE_BOX["top"]] - points[LEFT_EYE_BOX["bottom"]]), 1e-6)
+        right_width = max(np.linalg.norm(points[RIGHT_EYE_BOX["outer"]] - points[RIGHT_EYE_BOX["inner"]]), 1e-6)
+        right_height = max(np.linalg.norm(points[RIGHT_EYE_BOX["top"]] - points[RIGHT_EYE_BOX["bottom"]]), 1e-6)
+
+        left_outer = points[LEFT_EYE_BOX["outer"]]
+        left_top = points[LEFT_EYE_BOX["top"]]
+        right_outer = points[RIGHT_EYE_BOX["outer"]]
+        right_top = points[RIGHT_EYE_BOX["top"]]
+
+        left_iris_x = float((left_iris[0] - left_outer[0]) / left_width)
+        left_iris_y = float((left_iris[1] - left_top[1]) / left_height)
+        right_iris_x = float((right_iris[0] - right_outer[0]) / right_width)
+        right_iris_y = float((right_iris[1] - right_top[1]) / right_height)
+
+        head_yaw, head_pitch, head_pose_ok = self._estimate_head_pose(points, 1, 1)
+        pupil_dilation = float((left_width / left_height + right_width / right_height) * 0.5)
+
+        feature_vector = [
+            left_iris_x,
+            left_iris_y,
+            right_iris_x,
+            right_iris_y,
+            head_yaw,
+            head_pitch,
+        ]
+
+        finite_ok = all(math.isfinite(value) for value in feature_vector)
+        eye_box_ok = left_width > 3.0 and right_width > 3.0 and left_height > 1.0 and right_height > 1.0
+        iris_range_ok = all(-1.0 <= value <= 3.0 for value in feature_vector[:4])
+        quality_ok = finite_ok and eye_box_ok and iris_range_ok and head_pose_ok
+        return feature_vector, pupil_dilation, quality_ok
+
+    @staticmethod
+    def _estimate_head_pose(points: np.ndarray, width: int, height: int) -> tuple[float, float, bool]:
+        left = points[HEAD_POSE_REF["left"]]
+        right = points[HEAD_POSE_REF["right"]]
+        nose = points[HEAD_POSE_REF["nose"]]
+        mid = points[HEAD_POSE_REF["mid"]]
+
+        eye_mid = (left + right) * 0.5
+        baseline = max(np.linalg.norm(right - left), 1e-6)
+        yaw = float((nose[0] - eye_mid[0]) / baseline)
+        pitch = float((nose[1] - mid[1]) / baseline)
+        head_pose_ok = abs(yaw) < 0.20 and abs(pitch) < 0.25
+        return yaw, pitch, head_pose_ok
+
+    @staticmethod
+    def _annotate_frame(
+        frame_rgb: np.ndarray,
+        points: np.ndarray,
+        left_ear: float,
+        right_ear: float,
+        quality_ok: bool,
+        gaze_ready: bool,
+        gaze_x: float,
+        gaze_y: float,
+    ) -> None:
+        if cv2 is None:
+            return
+
+        for idx in LEFT_IRIS + RIGHT_IRIS:
+            x, y = points[idx]
+            cv2.circle(frame_rgb, (int(x), int(y)), 2, (0, 255, 255), -1)
+
+        status_text = f"EAR L:{left_ear:.3f} R:{right_ear:.3f} | quality:{'ok' if quality_ok else 'bad'}"
+        cv2.putText(frame_rgb, status_text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        if gaze_ready:
+            text = f"Gaze {gaze_x:.3f}, {gaze_y:.3f}"
+            cv2.putText(frame_rgb, text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
 
 
-class TrackerController(QWidget):
-    """GUI-facing orchestration layer for tracking, calibration, and recording."""
+class TrackerController(QObject):
+    """GUI-facing backend facade used by ``main.py``."""
 
     frame_ready = pyqtSignal(QImage)
     metrics_ready = pyqtSignal(dict)
@@ -690,144 +454,160 @@ class TrackerController(QWidget):
     recording_state_changed = pyqtSignal(bool)
     calibration_loaded = pyqtSignal(dict)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
-        self._thread: Optional[QThread] = None
-        self._worker: Optional[CameraWorker] = None
+        self._camera_thread: Optional[CameraThread] = None
         self._recording = RecordingWriter()
         self._calibration_model = CalibrationModel()
-        self._calibration_payload: Optional[dict[str, Any]] = None
         self._calibration_window: Optional[CalibrationWindow] = None
-        self._last_metrics: Optional[FrameMetrics] = None
+        self._latest_features: list[float] = []
+        self._latest_quality_ok = False
+        self._latest_metrics: dict[str, Any] = {}
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.isRunning():
-            self.status_changed.emit("Tracking is already running.")
+        if self._camera_thread is not None and self._camera_thread.isRunning():
+            self.status_changed.emit("Tracking already running.")
             return
 
-        self._thread = QThread(self)
-        self._worker = CameraWorker()
-        self._worker.update_calibration_model(self._calibration_model)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.frame_ready.connect(self.frame_ready)
-        self._worker.metrics_ready.connect(self._on_metrics_ready)
-        self._worker.status_changed.connect(self.status_changed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.finished.connect(self._clear_thread_references)
-        self._thread.start()
-        self.status_changed.emit("Tracking requested.")
+        self._camera_thread = CameraThread(parent=self)
+        self._camera_thread.frame_ready.connect(self.frame_ready)
+        self._camera_thread.metrics_ready.connect(self._handle_metrics)
+        self._camera_thread.feature_vector_ready.connect(self._handle_feature_vector)
+        self._camera_thread.status_changed.connect(self.status_changed)
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geometry = screen.availableGeometry()
+            self._camera_thread.set_screen_size(geometry.width(), geometry.height())
+
+        if self._calibration_model.coefficients is not None:
+            self._camera_thread.set_calibration_payload(self._current_calibration_payload())
+
+        self._camera_thread.start()
+        self.status_changed.emit("Tracking started.")
 
     def stop(self) -> None:
-        if self._worker is not None:
-            self._worker.stop()
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait(2000)
-        self.status_changed.emit("Tracking stop requested.")
+        if self._camera_thread is None:
+            self.status_changed.emit("Tracking already stopped.")
+            return
+        self._camera_thread.stop()
+        self._camera_thread = None
+        self.status_changed.emit("Tracking stopped.")
 
     def begin_calibration(self) -> None:
+        parent_widget = self.parent() if isinstance(self.parent(), QWidget) else None
         if self._calibration_window is not None:
-            self.status_changed.emit("Calibration is already active.")
-            return
-        self._calibration_window = CalibrationWindow(self)
-        self._calibration_window.status_message.connect(self.status_changed)
-        self._calibration_window.calibration_finished.connect(self._finalize_calibration)
-        self._calibration_window.start()
-
-    def unregister_calibration_window(self, window: CalibrationWindow) -> None:
-        if self._calibration_window is window:
+            self._calibration_window.close()
             self._calibration_window = None
 
+        self._calibration_window = CalibrationWindow(parent_widget)
+        self._calibration_window.status_message.connect(self.status_changed)
+        self._calibration_window.calibration_finished.connect(self._handle_calibration_finished)
+        self._calibration_window.destroyed.connect(self._handle_calibration_window_closed)
+        self._calibration_window.start()
+
     def save_calibration(self, path: str) -> None:
-        if self._calibration_payload is None:
-            raise ValueError("No calibration model is available to save.")
-        payload = CalibrationData(
-            timestamp=self._calibration_payload["timestamp"],
-            camera_resolution=list(self._calibration_payload["camera_resolution"]),
-            feature_names=list(self._calibration_payload["feature_names"]),
-            model_type=self._calibration_payload["model_type"],
-            transformation_matrix=list(self._calibration_payload["transformation_matrix"]),
-            target_layout=list(self._calibration_payload["target_layout"]),
-            validation_error_px=self._calibration_payload.get("validation_error_px"),
-        )
+        payload = self._current_calibration_payload(required=True)
         CalibrationStorage.save(path, payload)
         self.status_changed.emit(f"Calibration saved to {path}")
+        self.calibration_loaded.emit(payload.to_dict())
 
     def load_calibration(self, path: str) -> dict[str, Any]:
         payload = CalibrationStorage.load(path)
         self._calibration_model.load_from_dict(payload)
-        self._calibration_payload = payload
-        if self._worker is not None:
-            self._worker.update_calibration_model(self._calibration_model)
+        if self._camera_thread is not None:
+            self._camera_thread.set_calibration_payload(payload)
         self.calibration_loaded.emit(payload)
         self.status_changed.emit(f"Calibration loaded from {path}")
         return payload
 
     def start_recording(self, session_name: str, export_path: Optional[str] = None) -> None:
-        path = self._recording.start(session_name, export_path)
+        final_path = self._recording.start(session_name, export_path)
         self.recording_state_changed.emit(True)
-        self.status_changed.emit(f"Recording started: {path}")
+        self.status_changed.emit(f"Recording started: {final_path}")
 
     def stop_recording(self) -> None:
-        path = self._recording.stop()
+        output = self._recording.stop()
         self.recording_state_changed.emit(False)
-        if path:
-            self.status_changed.emit(f"Recording saved: {path}")
+        if output:
+            self.status_changed.emit(f"Recording saved: {output}")
         else:
             self.status_changed.emit("Recording stopped.")
 
     def shutdown(self) -> None:
         if self._recording.is_recording:
             self.stop_recording()
+        self.stop()
         if self._calibration_window is not None:
             self._calibration_window.close()
-        self.stop()
+            self._calibration_window = None
 
-    def _on_metrics_ready(self, payload: dict[str, Any]) -> None:
-        metrics = FrameMetrics(**payload)
-        self._last_metrics = metrics
-        self.metrics_ready.emit(payload)
+    def _handle_metrics(self, metrics: dict[str, Any]) -> None:
+        self._latest_metrics = dict(metrics)
         if self._recording.is_recording:
-            self._recording.append(metrics)
+            self._recording.append_dict(metrics)
+        self.metrics_ready.emit(metrics)
+
+    def _handle_feature_vector(self, features: list[float], quality_ok: bool) -> None:
+        self._latest_features = list(features)
+        self._latest_quality_ok = quality_ok
         if self._calibration_window is not None:
-            quality_ok = (
-                not metrics.blink_detected
-                and len(metrics.raw_feature_vector) == 6
-                and abs(metrics.head_yaw) < 18.0
-                and abs(metrics.head_pitch) < 18.0
-            )
-            self._calibration_window.push_feature_vector(metrics.raw_feature_vector, quality_ok)
+            self._calibration_window.push_feature_vector(features, quality_ok)
 
-    def _finalize_calibration(self, samples: list[CalibrationSample]) -> None:
-        screen = QGuiApplication.primaryScreen()
+    def _handle_calibration_finished(self, samples: list[CalibrationSample]) -> None:
+        screen = QApplication.primaryScreen()
         if screen is None:
-            screen_size = (1920, 1080)
-        else:
-            geometry = screen.availableGeometry()
-            screen_size = (geometry.width(), geometry.height())
+            raise RuntimeError("No primary screen available for calibration fitting.")
 
+        geometry = screen.availableGeometry()
+        screen_size = (geometry.width(), geometry.height())
         payload = self._calibration_model.fit(samples, screen_size)
-        self._calibration_payload = asdict(payload)
-        if self._worker is not None:
-            self._worker.update_calibration_model(self._calibration_model)
-        self.calibration_loaded.emit(self._calibration_payload)
+        if self._camera_thread is not None:
+            self._camera_thread.set_calibration_payload(payload.to_dict())
+        self.calibration_loaded.emit(payload.to_dict())
         self.status_changed.emit(
-            f"Calibration completed. Mean validation error: {payload.validation_error_px:.1f}px"
+            f"Calibration complete. Mean validation error: {payload.validation_error_px:.1f} px"
         )
 
-    def _clear_thread_references(self) -> None:
-        self._thread = None
-        self._worker = None
+    def _handle_calibration_window_closed(self) -> None:
+        self._calibration_window = None
+
+    def _current_calibration_payload(self, required: bool = False) -> CalibrationData:
+        if self._calibration_model.coefficients is None:
+            if required:
+                raise RuntimeError("No calibration available to save.")
+            return CalibrationData(
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                camera_resolution=[0, 0],
+                feature_names=self._calibration_model.FEATURE_NAMES,
+                model_type="polynomial_regression_order_2",
+                transformation_matrix=[],
+                target_layout=self._calibration_model.target_layout,
+                validation_error_px=None,
+            )
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geometry = screen.availableGeometry()
+            resolution = [geometry.width(), geometry.height()]
+        else:
+            resolution = [0, 0]
+
+        return CalibrationData(
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            camera_resolution=resolution,
+            feature_names=self._calibration_model.FEATURE_NAMES,
+            model_type="polynomial_regression_order_2",
+            transformation_matrix=self._calibration_model.coefficients.tolist(),
+            target_layout=self._calibration_model.target_layout,
+            validation_error_px=self._calibration_model.validation_error_px,
+        )
 
 
 __all__ = [
-    "CalibrationData",
-    "CalibrationStorage",
-    "TrackerController",
-    "CameraWorker",
-    "CalibrationModel",
     "BlinkDetector",
+    "CalibrationStorage",
+    "CameraThread",
+    "RecordingWriter",
+    "TrackerController",
 ]
