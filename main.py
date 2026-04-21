@@ -593,6 +593,172 @@ class RecordingTab(QWidget):
         self.log_output.append(text)
 
 
+class PerspectiveViewport3D(QWidget):
+    """Wizualizacja pseudo-3D z perspektywą zależną od pozycji głowy."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(420)
+        self._yaw = 0.0
+        self._pitch = 0.0
+        self._distance_scale = 1.0
+        self._tracking_ready = False
+        self._distance_baseline: Optional[float] = None
+
+    def update_from_metrics(self, metrics: dict[str, Any]) -> None:
+        """Aktualizuje parametry kamery na podstawie telemetrii śledzenia."""
+        self._tracking_ready = bool(metrics.get("tracking_ready", False))
+        if not self._tracking_ready:
+            self.update()
+            return
+
+        yaw = float(metrics.get("head_yaw", 0.0))
+        pitch = float(metrics.get("head_pitch", 0.0))
+        pupil = float(metrics.get("pupil_dilation", 0.0))
+
+        # Wygładzanie redukuje mikrodrgania sygnału z landmarków.
+        self._yaw = 0.84 * self._yaw + 0.16 * yaw
+        self._pitch = 0.84 * self._pitch + 0.16 * pitch
+
+        # Używamy promienia tęczówki jako prostego przybliżenia dystansu.
+        # Większa wartość zwykle oznacza mniejszą odległość od kamery.
+        if pupil > 1e-6:
+            if self._distance_baseline is None:
+                self._distance_baseline = pupil
+            else:
+                self._distance_baseline = 0.98 * self._distance_baseline + 0.02 * pupil
+            ratio = pupil / max(self._distance_baseline, 1e-6)
+            self._distance_scale = float(max(0.65, min(1.45, ratio)))
+
+        self.update()
+
+    @staticmethod
+    def _project_point(
+        point: tuple[float, float, float],
+        eye: tuple[float, float, float],
+    ) -> tuple[float, float]:
+        """Rzutuje punkt 3D na płaszczyznę ekranu (z=0) metodą pinhole camera."""
+        px, py, pz = point
+        ex, ey, ez = eye
+        denom = ez - pz
+        if abs(denom) < 1e-6:
+            denom = 1e-6
+        t = ez / denom
+        sx = ex + (px - ex) * t
+        sy = ey + (py - ey) * t
+        return sx, sy
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#020617"))
+
+        frame = self.rect().adjusted(36, 36, -36, -36)
+        painter.setPen(QPen(QColor("#1E293B"), 2))
+        painter.setBrush(QColor("#0F172A"))
+        painter.drawRoundedRect(frame, 12, 12)
+
+        # Przekształcenie pozy głowy na pozycję "wirtualnego oka" widza.
+        # Dzięki temu obiekt wydaje się znajdować za ekranem.
+        yaw_norm = max(-1.0, min(1.0, self._yaw / 20.0))
+        pitch_norm = max(-1.0, min(1.0, self._pitch / 20.0))
+        cam_x = yaw_norm * 0.55
+        cam_y = -pitch_norm * 0.45
+        cam_z = 2.0 / max(self._distance_scale, 0.35)
+        eye = (cam_x, cam_y, cam_z)
+
+        # Sześcian osadzony "za ekranem", czyli przy ujemnych wartościach Z.
+        size = 0.62
+        z_center = -1.8
+        cube_vertices = [
+            (-size, -size, z_center - size),
+            (size, -size, z_center - size),
+            (size, size, z_center - size),
+            (-size, size, z_center - size),
+            (-size, -size, z_center + size),
+            (size, -size, z_center + size),
+            (size, size, z_center + size),
+            (-size, size, z_center + size),
+        ]
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+
+        projected = [self._project_point(point, eye) for point in cube_vertices]
+        scale = min(frame.width(), frame.height()) * 0.36
+        cx = frame.center().x()
+        cy = frame.center().y()
+        points_2d = [QPointF(cx + p[0] * scale, cy + p[1] * scale) for p in projected]
+
+        glow_alpha = 210 if self._tracking_ready else 110
+        painter.setPen(QPen(QColor(56, 189, 248, glow_alpha), 2))
+        for start, end in edges:
+            painter.drawLine(points_2d[start], points_2d[end])
+
+        # Delikatna "mgła głębi" wzmacnia złudzenie odległości obiektu.
+        painter.setPen(QPen(QColor(125, 211, 252, 55), 1))
+        for ring in range(5):
+            inset = int(18 + ring * 12)
+            r = frame.adjusted(inset, inset, -inset, -inset)
+            if r.width() > 0 and r.height() > 0:
+                painter.drawRoundedRect(r, 8, 8)
+
+        info_text = (
+            "Rusz głową na boki i w pionie, aby zmienić perspektywę.\n"
+            "Przybliż/oddal głowę od kamery, aby zmienić odczucie głębi."
+        )
+        painter.setPen(QColor("#CBD5E1"))
+        painter.drawText(
+            frame.adjusted(10, 10, -10, -10),
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+            info_text,
+        )
+
+
+class Depth3DTab(QWidget):
+    """Zakładka prezentująca efekt paralaksy i głębi 3D za ekranem."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.viewport = PerspectiveViewport3D()
+        self.status_label = QLabel("Uruchom tracking, aby aktywować perspektywę opartą o ruch głowy.")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Głębia 3D")
+        title.setStyleSheet("font-size: 22px; font-weight: 600;")
+        subtitle = QLabel(
+            "Wizualizacja obiektu 3D osadzonego za ekranem, aktualizowana na żywo "
+            "na podstawie pozy i odległości głowy od kamery."
+        )
+        subtitle.setWordWrap(True)
+        self.status_label.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.viewport, stretch=1)
+        layout.addWidget(self.status_label)
+
+    def update_metrics(self, metrics: dict[str, Any]) -> None:
+        self.viewport.update_from_metrics(metrics)
+        tracking_ready = bool(metrics.get("tracking_ready", False))
+        if tracking_ready:
+            yaw = float(metrics.get("head_yaw", 0.0))
+            pitch = float(metrics.get("head_pitch", 0.0))
+            self.status_label.setText(
+                f"Tracking aktywny. Head yaw: {yaw:.1f}°, head pitch: {pitch:.1f}°."
+            )
+        else:
+            self.status_label.setText(
+                "Brak stabilnego trackingu. Spójrz w kamerę i utrzymaj twarz w kadrze."
+            )
+
+
 class MainWindow(QMainWindow):
     """Top-level application shell with tabbed navigation."""
 
@@ -603,6 +769,7 @@ class MainWindow(QMainWindow):
         self.live_tab = LiveTrackingTab()
         self.calibration_tab = CalibrationTab()
         self.recording_tab = RecordingTab()
+        self.depth_3d_tab = Depth3DTab()
         self._setup_window()
         self._build_tabs()
         self._build_menu()
@@ -619,6 +786,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.live_tab, "Live Tracking")
         self.tabs.addTab(self.calibration_tab, "Calibration")
         self.tabs.addTab(self.recording_tab, "Recording & Export")
+        self.tabs.addTab(self.depth_3d_tab, "Głębia 3D")
 
         for title in (
             "Heatmap Generator",
@@ -662,6 +830,7 @@ class MainWindow(QMainWindow):
 
         self.tracker.frame_ready.connect(self.live_tab.update_frame)
         self.tracker.metrics_ready.connect(self.live_tab.update_metrics)
+        self.tracker.metrics_ready.connect(self.depth_3d_tab.update_metrics)
         self.tracker.status_changed.connect(self._broadcast_status)
         self.tracker.recording_state_changed.connect(self.recording_tab.set_recording_state)
         self.tracker.calibration_loaded.connect(self.calibration_tab.update_metadata)
