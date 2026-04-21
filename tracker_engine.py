@@ -20,6 +20,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -391,6 +392,116 @@ class CalibrationModel:
         return nx, ny, True
 
 
+class KalmanGazeFilter:
+    """Filtr Kalmana stabilizujący współrzędne spojrzenia w przestrzeni [0, 1]."""
+
+    def __init__(
+        self,
+        process_noise: float = 2.5e-3,
+        measurement_noise: float = 2.0e-2,
+        innovation_gate: float = 6.0,
+    ) -> None:
+        # Model stanu: [x, y, vx, vy], gdzie x/y to pozycja wzroku,
+        # a vx/vy odpowiadają prędkości zmiany spojrzenia.
+        self._state = np.zeros((4, 1), dtype=np.float64)
+        self._covariance = np.eye(4, dtype=np.float64)
+        self._process_noise = float(process_noise)
+        self._measurement_noise = float(measurement_noise)
+        self._innovation_gate = float(max(innovation_gate, 1.0))
+        self._initialized = False
+
+        # Macierz pomiaru: obserwujemy wyłącznie pozycję (x, y).
+        self._measurement_matrix = np.asarray(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float64
+        )
+
+    def reset(self) -> None:
+        """Resetuje filtr po utracie twarzy lub kalibracji."""
+        self._state.fill(0.0)
+        self._covariance = np.eye(4, dtype=np.float64)
+        self._initialized = False
+
+    def update(
+        self,
+        gaze_x: float,
+        gaze_y: float,
+        dt: float,
+        measurement_scale: float = 1.0,
+    ) -> tuple[float, float]:
+        """Aktualizuje filtr i zwraca wygładzone współrzędne spojrzenia."""
+        measurement = np.asarray([[float(gaze_x)], [float(gaze_y)]], dtype=np.float64)
+        dt = float(np.clip(dt, 1e-3, 0.2))
+        measurement_scale = float(np.clip(measurement_scale, 0.5, 6.0))
+
+        if not self._initialized:
+            self._state = np.asarray([[measurement[0, 0]], [measurement[1, 0]], [0.0], [0.0]])
+            self._covariance = np.eye(4, dtype=np.float64) * 0.2
+            self._initialized = True
+            return float(measurement[0, 0]), float(measurement[1, 0])
+
+        transition = np.asarray(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        # Szum procesu rośnie wraz z krokiem czasowym, dzięki czemu filtr
+        # lepiej reaguje na szybkie ruchy gałki ocznej.
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt2 * dt2
+        process_cov = self._process_noise * np.asarray(
+            [
+                [dt4 / 4.0, 0.0, dt3 / 2.0, 0.0],
+                [0.0, dt4 / 4.0, 0.0, dt3 / 2.0],
+                [dt3 / 2.0, 0.0, dt2, 0.0],
+                [0.0, dt3 / 2.0, 0.0, dt2],
+            ],
+            dtype=np.float64,
+        )
+
+        measurement_cov = np.eye(2, dtype=np.float64) * (self._measurement_noise * measurement_scale)
+
+        predicted_state = transition @ self._state
+        predicted_covariance = transition @ self._covariance @ transition.T + process_cov
+
+        innovation = measurement - (self._measurement_matrix @ predicted_state)
+        innovation_covariance = (
+            self._measurement_matrix @ predicted_covariance @ self._measurement_matrix.T
+            + measurement_cov
+        )
+
+        # Bramka innowacji ogranicza wpływ pojedynczych odskoków punktu spojrzenia.
+        try:
+            mahalanobis = float(
+                innovation.T @ np.linalg.pinv(innovation_covariance) @ innovation
+            )
+        except Exception:
+            mahalanobis = 0.0
+        if mahalanobis > self._innovation_gate:
+            innovation *= 0.35
+
+        kalman_gain = (
+            predicted_covariance
+            @ self._measurement_matrix.T
+            @ np.linalg.pinv(innovation_covariance)
+        )
+
+        self._state = predicted_state + kalman_gain @ innovation
+        identity = np.eye(4, dtype=np.float64)
+        self._covariance = (identity - kalman_gain @ self._measurement_matrix) @ predicted_covariance
+
+        filtered_x = float(np.clip(self._state[0, 0], 0.0, 1.0))
+        filtered_y = float(np.clip(self._state[1, 0], 0.0, 1.0))
+        self._state[0, 0] = filtered_x
+        self._state[1, 0] = filtered_y
+        return filtered_x, filtered_y
+
+
 class CalibrationWindow(QWidget):
     """Fullscreen target presenter for the 9-point calibration routine."""
 
@@ -528,6 +639,9 @@ class CameraWorker(QObject):
         self.blink_detector = BlinkDetector()
         self._screen_size = self._current_screen_size()
         self._calibration_model = CalibrationModel()
+        self._gaze_filter = KalmanGazeFilter()
+        self._last_metrics_timestamp: Optional[float] = None
+        self._gaze_prefilter_window: deque[tuple[float, float]] = deque(maxlen=5)
 
     def stop(self) -> None:
         self._mutex.lock()
@@ -654,8 +768,12 @@ class CameraWorker(QObject):
 
     def _build_metrics(self, image_rgb: np.ndarray, results: Any) -> FrameMetrics:
         timestamp = datetime.now().isoformat(timespec="milliseconds")
+        now_perf = time.perf_counter()
         metrics = FrameMetrics(timestamp=timestamp)
         if not results.multi_face_landmarks:
+            self._gaze_filter.reset()
+            self._last_metrics_timestamp = None
+            self._gaze_prefilter_window.clear()
             return metrics
 
         face_landmarks = results.multi_face_landmarks[0]
@@ -670,6 +788,34 @@ class CameraWorker(QObject):
         blink_detected, blink_rate = self.blink_detector.update(left_eye, right_eye, head_pose_ok)
         features = self._extract_feature_vector(left_eye, right_eye, left_iris, right_iris, head_yaw, head_pitch)
         gaze_x, gaze_y, tracking_ready = self._calibration_model.map_to_screen(features, self._screen_size)
+        if tracking_ready:
+            # Prefiltr medianowy usuwa krótkie skoki charakterystyczne dla webcam + MediaPipe.
+            self._gaze_prefilter_window.append((gaze_x, gaze_y))
+            stacked = np.asarray(self._gaze_prefilter_window, dtype=np.float64)
+            median_x = float(np.median(stacked[:, 0]))
+            median_y = float(np.median(stacked[:, 1]))
+
+            # Adaptacyjny szum pomiaru: im gorsza jakość geometrii twarzy,
+            # tym słabiej ufamy bieżącemu pomiarowi.
+            pose_penalty = min(abs(head_yaw) / 20.0 + abs(head_pitch) / 20.0, 2.0)
+            blink_penalty = 1.25 if blink_detected else 0.0
+            measurement_scale = 1.0 + pose_penalty + blink_penalty
+
+            if self._last_metrics_timestamp is None:
+                dt = 1.0 / max(self.camera_fps, 1.0)
+            else:
+                dt = now_perf - self._last_metrics_timestamp
+            gaze_x, gaze_y = self._gaze_filter.update(
+                median_x,
+                median_y,
+                dt,
+                measurement_scale=measurement_scale,
+            )
+            self._last_metrics_timestamp = now_perf
+        else:
+            self._gaze_filter.reset()
+            self._last_metrics_timestamp = None
+            self._gaze_prefilter_window.clear()
         pupil_dilation = self._estimate_pupil_dilation(left_iris, right_iris)
 
         return FrameMetrics(
