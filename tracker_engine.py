@@ -1185,6 +1185,17 @@ class TrackerController(QWidget):
     def save_calibration(self, path: str) -> None:
         if self._calibration_payload is None:
             raise ValueError("No calibration model is available to save.")
+        model_type = str(self._calibration_payload.get("model_type", ""))
+        matrix = self._calibration_payload.get("transformation_matrix") or []
+        coeff_rows = len(matrix) if isinstance(matrix, list) else 0
+        is_normalized_model = "normalized" in model_type or coeff_rows == 28
+        mean = self._calibration_payload.get("feature_mean")
+        std = self._calibration_payload.get("feature_std")
+        # Chronimy zapis przed utrwaleniem niekompletnego modelu z normalizacją.
+        if is_normalized_model and (mean is None or std is None):
+            raise ValueError(
+                "Cannot save normalized calibration without feature_mean/feature_std."
+            )
         # Zachowujemy komplet parametrów modelu, aby po wczytaniu predykcja była identyczna.
         payload = CalibrationData(
             timestamp=self._calibration_payload["timestamp"],
@@ -1194,8 +1205,8 @@ class TrackerController(QWidget):
             transformation_matrix=list(self._calibration_payload["transformation_matrix"]),
             target_layout=list(self._calibration_payload["target_layout"]),
             validation_error_px=self._calibration_payload.get("validation_error_px"),
-            feature_mean=self._calibration_payload.get("feature_mean"),
-            feature_std=self._calibration_payload.get("feature_std"),
+            feature_mean=list(mean) if mean is not None else None,
+            feature_std=list(std) if std is not None else None,
         )
         CalibrationStorage.save(path, payload)
         self.status_changed.emit(f"Calibration saved to {path}")
