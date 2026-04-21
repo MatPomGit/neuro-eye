@@ -337,19 +337,25 @@ class LiveTrackingTab(QWidget):
         self.stop_button.clicked.connect(lambda: self.tracking_toggled.emit(False))
         self.stop_button.setEnabled(False)
 
-        left_panel = QVBoxLayout()
-        left_panel.addWidget(self.video_label, stretch=1)
-        left_panel.addWidget(self.eye_position_chart, stretch=0)
-        left_panel.addWidget(self.gaze_focus_chart, stretch=0)
+        # Lewa kolumna zawiera wyłącznie podgląd kamery + sterowanie.
+        # Dzięki temu wykresy nigdy nie zasłaniają obrazu.
+        video_panel = QVBoxLayout()
+        video_panel.addWidget(self.video_label, stretch=1)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.stop_button)
         button_row.addStretch(1)
-        left_panel.addLayout(button_row)
+        video_panel.addLayout(button_row)
 
-        root.addLayout(left_panel, stretch=5)
-        root.addWidget(controls, stretch=2)
+        # Prawa kolumna agreguje telemetrię i wykresy poza oknem obrazu.
+        side_panel = QVBoxLayout()
+        side_panel.addWidget(controls, stretch=0)
+        side_panel.addWidget(self.eye_position_chart, stretch=1)
+        side_panel.addWidget(self.gaze_focus_chart, stretch=1)
+
+        root.addLayout(video_panel, stretch=5)
+        root.addLayout(side_panel, stretch=3)
 
     def _build_metrics_panel(self) -> QWidget:
         panel = QGroupBox("Live Parameters")
@@ -607,13 +613,14 @@ class PerspectiveViewport3D(QWidget):
         self._yaw = 0.0
         self._pitch = 0.0
         self._distance_scale = 1.0
-        self._tracking_ready = False
+        self._head_pose_ready = False
         self._distance_baseline: Optional[float] = None
 
     def update_from_metrics(self, metrics: dict[str, Any]) -> None:
         """Aktualizuje parametry kamery na podstawie telemetrii śledzenia."""
-        self._tracking_ready = bool(metrics.get("tracking_ready", False))
-        if not self._tracking_ready:
+        raw_features = metrics.get("raw_feature_vector", [])
+        self._head_pose_ready = isinstance(raw_features, list) and len(raw_features) >= 6
+        if not self._head_pose_ready:
             self.update()
             return
 
@@ -698,7 +705,7 @@ class PerspectiveViewport3D(QWidget):
         cy = frame.center().y()
         points_2d = [QPointF(cx + p[0] * scale, cy + p[1] * scale) for p in projected]
 
-        glow_alpha = 210 if self._tracking_ready else 110
+        glow_alpha = 210 if self._head_pose_ready else 110
         painter.setPen(QPen(QColor(56, 189, 248, glow_alpha), 2))
         for start, end in edges:
             painter.drawLine(points_2d[start], points_2d[end])
@@ -751,16 +758,19 @@ class Depth3DTab(QWidget):
 
     def update_metrics(self, metrics: dict[str, Any]) -> None:
         self.viewport.update_from_metrics(metrics)
-        tracking_ready = bool(metrics.get("tracking_ready", False))
-        if tracking_ready:
+        # Zakładka 3D ma działać również bez kalibracji ekranu.
+        # Dlatego opieramy gotowość na obecności landmarków twarzy.
+        raw_features = metrics.get("raw_feature_vector", [])
+        head_pose_ready = isinstance(raw_features, list) and len(raw_features) >= 6
+        if head_pose_ready:
             yaw = float(metrics.get("head_yaw", 0.0))
             pitch = float(metrics.get("head_pitch", 0.0))
             self.status_label.setText(
-                f"Tracking aktywny. Head yaw: {yaw:.1f}°, head pitch: {pitch:.1f}°."
+                f"Detekcja twarzy aktywna. Head yaw: {yaw:.1f}°, head pitch: {pitch:.1f}°."
             )
         else:
             self.status_label.setText(
-                "Brak stabilnego trackingu. Spójrz w kamerę i utrzymaj twarz w kadrze."
+                "Brak landmarków twarzy. Spójrz w kamerę i utrzymaj twarz w kadrze."
             )
 
 
