@@ -170,8 +170,19 @@ class CalibrationModel:
         self.target_layout = payload.get("target_layout", self.default_target_layout())
         mean = payload.get("feature_mean")
         std = payload.get("feature_std")
-        self.feature_mean = np.asarray(mean, dtype=np.float64) if mean else np.zeros(6, dtype=np.float64)
-        self.feature_std = np.asarray(std, dtype=np.float64) if std else np.ones(6, dtype=np.float64)
+        model_type = str(payload.get("model_type", ""))
+        is_normalized_model = "normalized" in model_type or (
+            self.coefficients is not None and self.coefficients.shape[0] == 28
+        )
+        # Dla nowego modelu z normalizacją brak statystyk jest błędem krytycznym.
+        if is_normalized_model and (mean is None or std is None):
+            raise ValueError(
+                "Calibration file is missing feature_mean/feature_std required by normalized model."
+            )
+        self.feature_mean = np.asarray(mean, dtype=np.float64) if mean is not None else np.zeros(6, dtype=np.float64)
+        self.feature_std = np.asarray(std, dtype=np.float64) if std is not None else np.ones(6, dtype=np.float64)
+        if self.feature_mean.shape != (6,) or self.feature_std.shape != (6,):
+            raise ValueError("Calibration feature_mean/feature_std must each contain exactly 6 values.")
         self.feature_std = np.clip(self.feature_std, 1e-4, None)
 
     def map_to_screen(

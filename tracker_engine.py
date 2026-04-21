@@ -434,8 +434,19 @@ class CalibrationModel:
         self.target_layout = payload.get("target_layout", self.default_target_layout())
         mean = payload.get("feature_mean")
         std = payload.get("feature_std")
-        self.feature_mean = np.asarray(mean, dtype=np.float64) if mean else np.zeros(6, dtype=np.float64)
-        self.feature_std = np.asarray(std, dtype=np.float64) if std else np.ones(6, dtype=np.float64)
+        model_type = str(payload.get("model_type", ""))
+        is_normalized_model = "normalized" in model_type or (
+            self.coefficients is not None and self.coefficients.shape[0] == 28
+        )
+        # Dla modeli z normalizacją wymagamy statystyk cech, aby uniknąć cichej degradacji jakości.
+        if is_normalized_model and (mean is None or std is None):
+            raise ValueError(
+                "Calibration file is missing feature_mean/feature_std required by normalized model."
+            )
+        self.feature_mean = np.asarray(mean, dtype=np.float64) if mean is not None else np.zeros(6, dtype=np.float64)
+        self.feature_std = np.asarray(std, dtype=np.float64) if std is not None else np.ones(6, dtype=np.float64)
+        if self.feature_mean.shape != (6,) or self.feature_std.shape != (6,):
+            raise ValueError("Calibration feature_mean/feature_std must each contain exactly 6 values.")
         self.feature_std = np.clip(self.feature_std, 1e-4, None)
 
     def map_to_screen(self, features: list[float], screen_size: tuple[int, int]) -> tuple[float, float, bool]:
@@ -1174,6 +1185,18 @@ class TrackerController(QWidget):
     def save_calibration(self, path: str) -> None:
         if self._calibration_payload is None:
             raise ValueError("No calibration model is available to save.")
+        model_type = str(self._calibration_payload.get("model_type", ""))
+        matrix = self._calibration_payload.get("transformation_matrix") or []
+        coeff_rows = len(matrix) if isinstance(matrix, list) else 0
+        is_normalized_model = "normalized" in model_type or coeff_rows == 28
+        mean = self._calibration_payload.get("feature_mean")
+        std = self._calibration_payload.get("feature_std")
+        # Chronimy zapis przed utrwaleniem niekompletnego modelu z normalizacją.
+        if is_normalized_model and (mean is None or std is None):
+            raise ValueError(
+                "Cannot save normalized calibration without feature_mean/feature_std."
+            )
+        # Zachowujemy komplet parametrów modelu, aby po wczytaniu predykcja była identyczna.
         payload = CalibrationData(
             timestamp=self._calibration_payload["timestamp"],
             camera_resolution=list(self._calibration_payload["camera_resolution"]),
@@ -1182,6 +1205,8 @@ class TrackerController(QWidget):
             transformation_matrix=list(self._calibration_payload["transformation_matrix"]),
             target_layout=list(self._calibration_payload["target_layout"]),
             validation_error_px=self._calibration_payload.get("validation_error_px"),
+            feature_mean=list(mean) if mean is not None else None,
+            feature_std=list(std) if std is not None else None,
         )
         CalibrationStorage.save(path, payload)
         self.status_changed.emit(f"Calibration saved to {path}")
