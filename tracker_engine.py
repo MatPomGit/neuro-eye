@@ -1171,6 +1171,7 @@ class TrackerController(QWidget):
             self._calibration_window.push_feature_vector(metrics.raw_feature_vector, quality_ok)
 
     def _finalize_calibration(self, samples: list[CalibrationSample]) -> None:
+        """Finalizuje kalibrację, aktualizuje model i zapisuje wynik do pliku YAML."""
         screen = QGuiApplication.primaryScreen()
         if screen is None:
             screen_size = (1920, 1080)
@@ -1180,16 +1181,28 @@ class TrackerController(QWidget):
 
         payload = self._calibration_model.fit(samples, screen_size)
         self._calibration_payload = asdict(payload)
+        # Każdą zakończoną kalibrację automatycznie archiwizujemy lokalnie,
+        # aby użytkownik nie utracił modelu po przypadkowym zamknięciu aplikacji.
+        autosave_path = self._build_autosave_calibration_path(payload.timestamp)
+        CalibrationStorage.save(autosave_path, payload)
         if self._worker is not None:
             self._worker.update_calibration_model(self._calibration_model)
         self.calibration_loaded.emit(self._calibration_payload)
         self.status_changed.emit(
-            f"Calibration completed. Mean validation error: {payload.validation_error_px:.1f}px"
+            "Calibration completed. "
+            f"Mean validation error: {payload.validation_error_px:.1f}px. "
+            f"Saved to: {autosave_path}"
         )
 
     def _clear_thread_references(self) -> None:
         self._thread = None
         self._worker = None
+
+    @staticmethod
+    def _build_autosave_calibration_path(timestamp: str) -> Path:
+        """Buduje ścieżkę autozapisu kalibracji w katalogu data/calibrations."""
+        safe_timestamp = timestamp.replace(":", "").replace(".", "").replace("T", "_")
+        return CALIBRATIONS_DIR / f"calibration_{safe_timestamp}.yaml"
 
 
 __all__ = [
