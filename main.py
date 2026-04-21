@@ -13,6 +13,7 @@ project bootstrapping, the UI still starts with a safe fallback stub.
 
 from __future__ import annotations
 
+import json
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QMessageBox,
     QPushButton,
+    QSlider,
     QStatusBar,
     QTabWidget,
     QTextEdit,
@@ -415,6 +417,389 @@ class LiveTrackingTab(QWidget):
             self.gaze_focus_chart.append_sample(self.snapshot.gaze_x, self.snapshot.gaze_y)
 
 
+class HeatmapCanvas(QWidget):
+    """Płótno rysujące mapę cieplną na podstawie historii punktów spojrzenia."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._points: deque[tuple[float, float]] = deque(maxlen=3000)
+        self._is_tracking_ready = False
+        self.setMinimumHeight(360)
+
+    def append_gaze_sample(self, gaze_x: float, gaze_y: float, tracking_ready: bool) -> None:
+        """Dopisuje próbkę do mapy cieplnej tylko dla wiarygodnego trackingu."""
+        self._is_tracking_ready = bool(tracking_ready)
+        if not self._is_tracking_ready:
+            self.update()
+            return
+        self._points.append((self._clamp(gaze_x), self._clamp(gaze_y)))
+        self.update()
+
+    def clear_points(self) -> None:
+        """Czyści wszystkie punkty mapy cieplnej."""
+        self._points.clear()
+        self.update()
+
+    def point_count(self) -> int:
+        """Zwraca liczbę próbek aktualnie widocznych na mapie."""
+        return len(self._points)
+
+    @staticmethod
+    def _clamp(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#020617"))
+
+        area = self.rect().adjusted(14, 14, -14, -14)
+        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.setBrush(QColor("#0B1220"))
+        painter.drawRoundedRect(area, 10, 10)
+
+        if not self._points:
+            painter.setPen(QColor("#94A3B8"))
+            painter.drawText(
+                area.adjusted(10, 10, -10, -10),
+                Qt.AlignmentFlag.AlignCenter,
+                "Brak próbek mapy cieplnej.\nUruchom tracking i patrz w ekran.",
+            )
+            return
+
+        # Starsze punkty są słabsze wizualnie, dzięki czemu lepiej widać aktualny obszar fiksacji.
+        total = len(self._points)
+        for index, (x_norm, y_norm) in enumerate(self._points):
+            x_pos = area.left() + x_norm * area.width()
+            y_pos = area.top() + y_norm * area.height()
+
+            age_ratio = (index + 1) / max(total, 1)
+            alpha = int(20 + age_ratio * 175)
+            radius = 5 + int(age_ratio * 10)
+            color = QColor(239, 68, 68, alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(x_pos, y_pos), radius, radius)
+
+        # Jasny marker ostatniego punktu ułatwia lokalizację bieżącego spojrzenia.
+        last_x, last_y = self._points[-1]
+        marker_x = area.left() + last_x * area.width()
+        marker_y = area.top() + last_y * area.height()
+        painter.setPen(QPen(QColor("#F8FAFC"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(marker_x, marker_y), 9, 9)
+
+
+class HeatmapTab(QWidget):
+    """Zakładka generatora mapy cieplnej spojrzenia w czasie rzeczywistym."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.canvas = HeatmapCanvas()
+        self.status_label = QLabel("Oczekiwanie na dane trackingu.")
+        self.sample_count_label = QLabel("Liczba próbek: 0")
+        self.clear_button = QPushButton("Wyczyść mapę")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        title = QLabel("Heatmap Generator")
+        title.setStyleSheet("font-size: 20px; font-weight: 600;")
+        subtitle = QLabel(
+            "Mapa cieplna pokazuje zagęszczenie punktów spojrzenia. "
+            "Jaśniejsze i większe plamy oznaczają częstsze fiksacje."
+        )
+        subtitle.setWordWrap(True)
+        self.status_label.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.canvas, stretch=1)
+        layout.addWidget(self.sample_count_label)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.clear_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+
+        self.clear_button.clicked.connect(self.canvas.clear_points)
+        self.clear_button.clicked.connect(self._refresh_sample_count)
+
+    def update_metrics(self, metrics: dict[str, Any]) -> None:
+        tracking_ready = bool(metrics.get("tracking_ready", False))
+        gaze_x = float(metrics.get("gaze_x", 0.0))
+        gaze_y = float(metrics.get("gaze_y", 0.0))
+        self.canvas.append_gaze_sample(gaze_x, gaze_y, tracking_ready)
+        self._refresh_sample_count()
+
+        if tracking_ready:
+            self.status_label.setText(
+                "Tracking aktywny. Punkty spojrzenia są zapisywane do mapy cieplnej."
+            )
+        else:
+            self.status_label.setText(
+                "Brak stabilnego trackingu. Mapa czeka na wiarygodne próbki."
+            )
+
+    def reset(self) -> None:
+        """Resetuje mapę, np. przy zatrzymaniu trackingu."""
+        self.canvas.clear_points()
+        self._refresh_sample_count()
+        self.status_label.setText("Mapa została wyczyszczona po zatrzymaniu trackingu.")
+
+    def _refresh_sample_count(self) -> None:
+        self.sample_count_label.setText(f"Liczba próbek: {self.canvas.point_count()}")
+
+
+@dataclass(slots=True)
+class AOIRegion:
+    """Definicja pojedynczego obszaru zainteresowania (AOI) w układzie znormalizowanym."""
+
+    name: str
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+    hits: int = 0
+
+    def contains(self, x_norm: float, y_norm: float) -> bool:
+        return self.x_min <= x_norm <= self.x_max and self.y_min <= y_norm <= self.y_max
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "x_min": self.x_min,
+            "y_min": self.y_min,
+            "x_max": self.x_max,
+            "y_max": self.y_max,
+            "hits": self.hits,
+        }
+
+
+class AOICanvas(QWidget):
+    """Płótno podglądu AOI z możliwością rysowania prostokątów myszą."""
+
+    aoi_drawn = pyqtSignal(float, float, float, float)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(360)
+        self._frame: Optional[QImage] = None
+        self._regions: list[AOIRegion] = []
+        self._drawing = False
+        self._start_point = QPointF()
+        self._end_point = QPointF()
+        self._last_gaze: Optional[tuple[float, float]] = None
+
+    def set_frame(self, image: QImage) -> None:
+        self._frame = image.copy()
+        self.update()
+
+    def set_regions(self, regions: list[AOIRegion]) -> None:
+        self._regions = list(regions)
+        self.update()
+
+    def set_last_gaze(self, gaze_x: float, gaze_y: float) -> None:
+        self._last_gaze = (max(0.0, min(1.0, gaze_x)), max(0.0, min(1.0, gaze_y)))
+        self.update()
+
+    def _to_norm(self, point: QPointF) -> tuple[float, float]:
+        width = max(float(self.width()), 1.0)
+        height = max(float(self.height()), 1.0)
+        return (
+            max(0.0, min(1.0, point.x() / width)),
+            max(0.0, min(1.0, point.y() / height)),
+        )
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drawing = True
+            self._start_point = event.position()
+            self._end_point = event.position()
+            self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:  # noqa: N802
+        if self._drawing:
+            self._end_point = event.position()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:  # noqa: N802
+        if self._drawing and event.button() == Qt.MouseButton.LeftButton:
+            self._drawing = False
+            self._end_point = event.position()
+            x0, y0 = self._to_norm(self._start_point)
+            x1, y1 = self._to_norm(self._end_point)
+            if abs(x1 - x0) > 0.02 and abs(y1 - y0) > 0.02:
+                self.aoi_drawn.emit(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            self.update()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#020617"))
+
+        if self._frame is not None and not self._frame.isNull():
+            painter.drawImage(self.rect(), self._frame)
+        else:
+            painter.setPen(QColor("#94A3B8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Brak podglądu kamery.")
+
+        painter.setPen(QPen(QColor(56, 189, 248, 210), 2))
+        for region in self._regions:
+            rx = region.x_min * self.width()
+            ry = region.y_min * self.height()
+            rw = (region.x_max - region.x_min) * self.width()
+            rh = (region.y_max - region.y_min) * self.height()
+            painter.drawRect(int(rx), int(ry), int(rw), int(rh))
+            painter.drawText(int(rx + 6), int(ry + 18), f"{region.name} ({region.hits})")
+
+        if self._drawing:
+            painter.setPen(QPen(QColor(251, 191, 36, 220), 2, Qt.PenStyle.DashLine))
+            rect_x = min(self._start_point.x(), self._end_point.x())
+            rect_y = min(self._start_point.y(), self._end_point.y())
+            rect_w = abs(self._start_point.x() - self._end_point.x())
+            rect_h = abs(self._start_point.y() - self._end_point.y())
+            painter.drawRect(int(rect_x), int(rect_y), int(rect_w), int(rect_h))
+
+        if self._last_gaze is not None:
+            gx = self._last_gaze[0] * self.width()
+            gy = self._last_gaze[1] * self.height()
+            painter.setPen(QPen(QColor("#F8FAFC"), 2))
+            painter.drawEllipse(QPointF(gx, gy), 6, 6)
+
+
+class AOIEditorTab(QWidget):
+    """Zakładka edycji obszarów AOI z prostą analizą trafień punktu spojrzenia."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.canvas = AOICanvas()
+        self.summary_box = QTextEdit()
+        self.summary_box.setReadOnly(True)
+        self.regions: list[AOIRegion] = []
+        self._region_counter = 1
+        self.clear_button = QPushButton("Wyczyść AOI")
+        self.export_button = QPushButton("Eksportuj AOI (JSON)")
+        self.import_button = QPushButton("Importuj AOI (JSON)")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        title = QLabel("Area of Interest (AOI) Editor")
+        title.setStyleSheet("font-size: 20px; font-weight: 600;")
+        description = QLabel(
+            "Narysuj AOI myszą na podglądzie kamery. System zlicza trafienia "
+            "punktu spojrzenia w każdym obszarze."
+        )
+        description.setWordWrap(True)
+        self.summary_box.setMinimumHeight(150)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.import_button)
+        button_row.addWidget(self.export_button)
+        button_row.addWidget(self.clear_button)
+        button_row.addStretch(1)
+
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addWidget(self.canvas, stretch=1)
+        layout.addLayout(button_row)
+        layout.addWidget(self.summary_box)
+
+        self.canvas.aoi_drawn.connect(self._add_region)
+        self.clear_button.clicked.connect(self._clear_regions)
+        self.export_button.clicked.connect(self._export_regions)
+        self.import_button.clicked.connect(self._import_regions)
+        self._refresh_summary()
+
+    def _add_region(self, x_min: float, y_min: float, x_max: float, y_max: float) -> None:
+        name = f"AOI {self._region_counter}"
+        self._region_counter += 1
+        self.regions.append(AOIRegion(name=name, x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max))
+        self.canvas.set_regions(self.regions)
+        self._refresh_summary()
+
+    def _clear_regions(self) -> None:
+        self.regions.clear()
+        self.canvas.set_regions(self.regions)
+        self._refresh_summary()
+
+    def _export_regions(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Eksport AOI",
+            str(DATA_DIR / "aoi_regions.json"),
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        payload = [region.as_dict() for region in self.regions]
+        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _import_regions(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import AOI",
+            str(DATA_DIR),
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            imported: list[AOIRegion] = []
+            for item in payload:
+                imported.append(
+                    AOIRegion(
+                        name=str(item.get("name", f"AOI {len(imported) + 1}")),
+                        x_min=float(item.get("x_min", 0.0)),
+                        y_min=float(item.get("y_min", 0.0)),
+                        x_max=float(item.get("x_max", 0.0)),
+                        y_max=float(item.get("y_max", 0.0)),
+                        hits=int(item.get("hits", 0)),
+                    )
+                )
+            self.regions = imported
+            self._region_counter = len(self.regions) + 1
+            self.canvas.set_regions(self.regions)
+            self._refresh_summary()
+        except Exception as exc:
+            QMessageBox.warning(self, "Błąd importu AOI", str(exc))
+
+    def update_frame(self, image: QImage) -> None:
+        self.canvas.set_frame(image)
+
+    def update_metrics(self, metrics: dict[str, Any]) -> None:
+        if not bool(metrics.get("tracking_ready", False)):
+            return
+        gaze_x = float(metrics.get("gaze_x", 0.0))
+        gaze_y = float(metrics.get("gaze_y", 0.0))
+        self.canvas.set_last_gaze(gaze_x, gaze_y)
+        changed = False
+        for region in self.regions:
+            if region.contains(gaze_x, gaze_y):
+                region.hits += 1
+                changed = True
+        if changed:
+            self.canvas.set_regions(self.regions)
+            self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        if not self.regions:
+            self.summary_box.setPlainText("Brak zdefiniowanych obszarów AOI.")
+            return
+        lines = ["Zdefiniowane AOI:"]
+        for region in self.regions:
+            lines.append(
+                f"- {region.name}: [{region.x_min:.2f}, {region.y_min:.2f}] -> "
+                f"[{region.x_max:.2f}, {region.y_max:.2f}], trafienia={region.hits}"
+            )
+        self.summary_box.setPlainText("\n".join(lines))
+
+
 class CalibrationPreview(QWidget):
     """Simple preview widget for the 3x3 calibration target layout."""
 
@@ -615,6 +1000,13 @@ class PerspectiveViewport3D(QWidget):
         self._distance_scale = 1.0
         self._head_pose_ready = False
         self._distance_baseline: Optional[float] = None
+        # Suwak steruje bazową głębokością obiektu: mniejsza wartość = bliżej użytkownika.
+        self._object_depth = -1.8
+
+    def set_object_depth(self, depth: float) -> None:
+        """Ustawia głębokość obiektu 3D względem ekranu (oś Z, wartości ujemne)."""
+        self._object_depth = float(max(-3.2, min(-0.7, depth)))
+        self.update()
 
     def update_from_metrics(self, metrics: dict[str, Any]) -> None:
         """Aktualizuje parametry kamery na podstawie telemetrii śledzenia."""
@@ -682,7 +1074,7 @@ class PerspectiveViewport3D(QWidget):
 
         # Sześcian osadzony "za ekranem", czyli przy ujemnych wartościach Z.
         size = 0.62
-        z_center = -1.8
+        z_center = self._object_depth
         cube_vertices = [
             (-size, -size, z_center - size),
             (size, -size, z_center - size),
@@ -737,6 +1129,8 @@ class Depth3DTab(QWidget):
         super().__init__()
         self.viewport = PerspectiveViewport3D()
         self.status_label = QLabel("Uruchom tracking, aby aktywować perspektywę opartą o ruch głowy.")
+        self.depth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.depth_value_label = QLabel("Głębokość obiektu: 50% (poziom domyślny)")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -750,11 +1144,37 @@ class Depth3DTab(QWidget):
         )
         subtitle.setWordWrap(True)
         self.status_label.setWordWrap(True)
+        self.depth_value_label.setWordWrap(True)
+
+        self.depth_slider.setRange(0, 100)
+        self.depth_slider.setValue(50)
+        self.depth_slider.setSingleStep(1)
+        self.depth_slider.setPageStep(5)
+        self.depth_slider.valueChanged.connect(self._on_depth_slider_changed)
+
+        slider_row = QHBoxLayout()
+        slider_row.addWidget(QLabel("Bliżej"))
+        slider_row.addWidget(self.depth_slider, stretch=1)
+        slider_row.addWidget(QLabel("Dalej"))
 
         layout.addWidget(title)
         layout.addWidget(subtitle)
+        layout.addLayout(slider_row)
+        layout.addWidget(self.depth_value_label)
         layout.addWidget(self.viewport, stretch=1)
         layout.addWidget(self.status_label)
+        self._on_depth_slider_changed(self.depth_slider.value())
+
+    def _on_depth_slider_changed(self, slider_value: int) -> None:
+        """Mapuje pozycję suwaka na głębokość obiektu i aktualizuje opis działania."""
+        depth_ratio = max(0.0, min(1.0, float(slider_value) / 100.0))
+        # 0% = obiekt bliżej (mniejsze zmiany perspektywy), 100% = obiekt dalej (większe zmiany).
+        target_depth = -0.8 - (2.2 * depth_ratio)
+        self.viewport.set_object_depth(target_depth)
+        self.depth_value_label.setText(
+            f"Głębokość obiektu: {slider_value}% | Z = {target_depth:.2f}. "
+            "Bliżej: spokojniejsza perspektywa, dalej: mocniejsza paralaksa."
+        )
 
     def update_metrics(self, metrics: dict[str, Any]) -> None:
         self.viewport.update_from_metrics(metrics)
@@ -784,7 +1204,9 @@ class MainWindow(QMainWindow):
         self.live_tab = LiveTrackingTab()
         self.calibration_tab = CalibrationTab()
         self.recording_tab = RecordingTab()
+        self.heatmap_tab = HeatmapTab()
         self.depth_3d_tab = Depth3DTab()
+        self.aoi_tab = AOIEditorTab()
         self._setup_window()
         self._build_tabs()
         self._build_menu()
@@ -801,11 +1223,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.live_tab, "Live Tracking")
         self.tabs.addTab(self.calibration_tab, "Calibration")
         self.tabs.addTab(self.recording_tab, "Recording & Export")
+        self.tabs.addTab(self.heatmap_tab, "Heatmap Generator")
         self.tabs.addTab(self.depth_3d_tab, "Głębia 3D")
+        self.tabs.addTab(self.aoi_tab, "Area of Interest (AOI) Editor")
 
         for title in (
-            "Heatmap Generator",
-            "Area of Interest (AOI) Editor",
             "External Hardware Sync (EEG/HRM)",
         ):
             placeholder = self._make_disabled_placeholder(title)
@@ -844,8 +1266,11 @@ class MainWindow(QMainWindow):
         self.recording_tab.recording_toggled.connect(self._handle_recording_toggle)
 
         self.tracker.frame_ready.connect(self.live_tab.update_frame)
+        self.tracker.frame_ready.connect(self.aoi_tab.update_frame)
         self.tracker.metrics_ready.connect(self.live_tab.update_metrics)
+        self.tracker.metrics_ready.connect(self.heatmap_tab.update_metrics)
         self.tracker.metrics_ready.connect(self.depth_3d_tab.update_metrics)
+        self.tracker.metrics_ready.connect(self.aoi_tab.update_metrics)
         self.tracker.status_changed.connect(self._broadcast_status)
         self.tracker.recording_state_changed.connect(self.recording_tab.set_recording_state)
         self.tracker.calibration_loaded.connect(self.calibration_tab.update_metadata)
@@ -862,6 +1287,7 @@ class MainWindow(QMainWindow):
                 self.tracker.start()
             else:
                 self.tracker.stop()
+                self.heatmap_tab.reset()
             self.live_tab.set_running_state(should_start)
         except Exception as exc:  # pragma: no cover - defensive UI boundary
             self._show_error("Tracking Error", str(exc))
