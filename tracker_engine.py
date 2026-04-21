@@ -41,18 +41,53 @@ try:
 except ImportError:  # pragma: no cover - environment dependent
     mp = None
 
-try:
-    if mp is not None and hasattr(mp, "solutions"):
-        MP_FACE_MESH = mp.solutions.face_mesh
-    else:
-        from mediapipe.python.solutions import face_mesh as MP_FACE_MESH  # type: ignore
-except Exception:  # pragma: no cover - environment dependent
-    MP_FACE_MESH = None
+
+def _resolve_mediapipe_face_mesh() -> tuple[Any, str | None]:
+    """Resolve a MediaPipe Face Mesh implementation across package variants."""
+    if mp is None:
+        return None, "MediaPipe is not installed."
+
+    candidates: list[tuple[str, str]] = [
+        ("top-level solutions API", "mediapipe.solutions.face_mesh"),
+        ("python solutions API", "mediapipe.python.solutions.face_mesh"),
+        ("legacy package API", "mediapipe.python.solutions.face_mesh"),
+    ]
+
+    for label, module_name in candidates:
+        try:
+            module = __import__(module_name, fromlist=["FaceMesh"])
+            if hasattr(module, "FaceMesh"):
+                return module, None
+        except Exception:
+            continue
+
+    return None, (
+        "Installed MediaPipe package does not expose Face Mesh / Iris landmarks. "
+        "The app will run in preview-only mode. Install a standard MediaPipe build "
+        "that includes the solutions API, for example mediapipe 0.10.x."
+    )
+
+
+MP_FACE_MESH, MP_FACE_MESH_ERROR = _resolve_mediapipe_face_mesh()
 
 
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_CAMERA_RESOLUTION = (1280, 720)
 DEFAULT_CAMERA_FPS = 30.0
+
+
+def _candidate_camera_indices(max_indices: int = 6) -> list[int]:
+    """Return likely camera indices without aggressively probing invalid devices."""
+    if os.name == "posix":
+        found: list[int] = []
+        for device in sorted(glob.glob("/dev/video*")):
+            name = os.path.basename(device)
+            suffix = name.replace("video", "", 1)
+            if suffix.isdigit():
+                found.append(int(suffix))
+        if found:
+            return found[:max_indices]
+    return list(range(max_indices))
 LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 LEFT_IRIS_INDICES = [468, 469, 470, 471, 472]
@@ -523,7 +558,10 @@ class CameraWorker(QObject):
             return
 
         if MP_FACE_MESH is None:
-            self.status_changed.emit("MediaPipe Face Mesh not available. Running preview-only camera mode.")
+            preview_msg = MP_FACE_MESH_ERROR or (
+                "MediaPipe Face Mesh not available. Running preview-only camera mode."
+            )
+            self.status_changed.emit(preview_msg)
             self._run_preview_only(cap)
             return
 
@@ -815,10 +853,10 @@ class TrackerController(QWidget):
             self._last_camera_scan = fallback
             return fallback
 
-        for index in range(max_indices):
-            cap = cv2.VideoCapture(index)
+        for index in _candidate_camera_indices(max_indices):
+            cap = self._probe_camera(index)
             try:
-                if not cap.isOpened():
+                if cap is None or not cap.isOpened():
                     continue
                 ok, _ = cap.read()
                 if ok:
@@ -827,12 +865,21 @@ class TrackerController(QWidget):
                     suffix = f" ({width}x{height})" if width > 0 and height > 0 else ""
                     cameras.append({"index": index, "label": f"Camera {index}{suffix}"})
             finally:
-                cap.release()
+                if cap is not None:
+                    cap.release()
 
         if not cameras:
             cameras = [{"index": self._camera_index, "label": f"Camera {self._camera_index}"}]
         self._last_camera_scan = cameras
         return cameras
+
+    @staticmethod
+    def _probe_camera(index: int) -> Any:
+        if cv2 is None:
+            return None
+        if os.name == "posix" and hasattr(cv2, "CAP_V4L2"):
+            return cv2.VideoCapture(int(index), cv2.CAP_V4L2)
+        return cv2.VideoCapture(int(index))
 
     def get_camera_index(self) -> int:
         return self._camera_index
