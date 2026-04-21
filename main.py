@@ -1,26 +1,31 @@
-"""
-Main entry point aplikacji Neuro-Eye.
+"""Main application entry point for the modular eye-tracking research app.
 
-Kod UI (PyQt6) trzyma logikę widoków i sterowanie sesją.
-Silnik śledzenia oraz kalibracja są delegowane do tracker_engine.py.
+This module defines the PyQt6 GUI shell requested in the project brief:
+- Live Tracking tab with video preview and real-time metrics.
+- Calibration tab with a 9-point calibration workflow entrypoint.
+- Recording & Export tab for session naming and data export control.
+- Disabled placeholder tabs for future research modules.
+
+The implementation is intentionally modular and integrates with ``tracker_engine``
+through a thin adapter layer. When the backend module is unavailable during early
+project bootstrapping, the UI still starts with a safe fallback stub.
 """
 
 from __future__ import annotations
 
-import csv
-import json
-import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -29,326 +34,600 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStatusBar,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from tracker_engine import CalibrationModel, GazeSample, TrackerThread
+
+try:
+    from tracker_engine import CalibrationStorage, TrackerController
+except ImportError:
+    CalibrationStorage = None
+    TrackerController = None
 
 
-class MainWindow(QMainWindow):
-    """Główne okno aplikacji z tabami badawczymi."""
+APP_NAME = "Eye Tracking Research Suite"
+APP_ORG = "PCDB"
+DEFAULT_WINDOW_SIZE = (1440, 900)
+CALIBRATION_FILENAME_FILTER = "YAML Files (*.yaml *.yml)"
+EXPORT_FILENAME_FILTER = "CSV Files (*.csv);;JSON Files (*.json)"
+
+
+@dataclass(slots=True)
+class TrackingSnapshot:
+    """Small view-model used by the GUI for current tracker outputs."""
+
+    gaze_x: float = 0.0
+    gaze_y: float = 0.0
+    pupil_dilation: float = 0.0
+    blink_rate: float = 0.0
+    tracking_ready: bool = False
+    blink_detected: bool = False
+
+
+class StubTrackerController(QWidget):
+    """Fallback backend used when ``tracker_engine`` is not importable.
+
+    The class mirrors the public surface expected from the real backend well
+    enough for GUI wiring and early manual testing.
+    """
+
+    frame_ready = pyqtSignal(QImage)
+    metrics_ready = pyqtSignal(dict)
+    status_changed = pyqtSignal(str)
+    recording_state_changed = pyqtSignal(bool)
+    calibration_loaded = pyqtSignal(dict)
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Neuro-Eye | Eye Tracking Research App")
-        self.resize(1300, 800)
+        self._is_running = False
+        self._is_recording = False
+        self._status = "Tracker backend not connected (stub mode)."
 
-        # Katalogi robocze na dane.
-        self.base_dir = Path.cwd()
-        self.calib_dir = self.base_dir / "data" / "calibrations"
-        self.session_dir = self.base_dir / "data" / "sessions"
-        self.calib_dir.mkdir(parents=True, exist_ok=True)
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-
-        # Model kalibracji współdzielony między UI i trackerem.
-        self.calibration_model = CalibrationModel()
-
-        # Bufor sesji nagrywania.
-        self.recording_enabled = False
-        self.recorded_samples: list[GazeSample] = []
-
-        # Wątek trackera (kamera + MediaPipe).
-        self.tracker_thread: Optional[TrackerThread] = None
-
-        # Budowa interfejsu.
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-
-        self.live_tab = self._build_live_tracking_tab()
-        self.calib_tab = self._build_calibration_tab()
-        self.record_tab = self._build_recording_tab()
-
-        self.tabs.addTab(self.live_tab, "Live Tracking")
-        self.tabs.addTab(self.calib_tab, "Calibration")
-        self.tabs.addTab(self.record_tab, "Recording & Export")
-
-        # Placeholdery rozwojowe (wyłączone).
-        self.tabs.addTab(QWidget(), "Heatmap Generator")
-        self.tabs.setTabEnabled(3, False)
-
-        self.tabs.addTab(QWidget(), "Area of Interest (AOI) Editor")
-        self.tabs.setTabEnabled(4, False)
-
-        self.tabs.addTab(QWidget(), "External Hardware Sync (EEG/HRM)")
-        self.tabs.setTabEnabled(5, False)
-
-        self._start_tracker()
-
-    def _build_live_tracking_tab(self) -> QWidget:
-        """Tworzy zakładkę podglądu na żywo i panel parametrów."""
-        tab = QWidget()
-        layout = QHBoxLayout(tab)
-
-        # Lewa część: obraz z kamery.
-        self.video_label = QLabel("No camera feed")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(900, 650)
-        self.video_label.setStyleSheet("background-color: #111; color: #ddd;")
-        layout.addWidget(self.video_label, stretch=3)
-
-        # Prawa część: parametry.
-        panel = QGroupBox("Real-time Parameters")
-        panel_layout = QFormLayout(panel)
-
-        self.lbl_gaze_x = QLabel("-")
-        self.lbl_gaze_y = QLabel("-")
-        self.lbl_pupil = QLabel("-")
-        self.lbl_blink = QLabel("-")
-
-        panel_layout.addRow("Gaze X:", self.lbl_gaze_x)
-        panel_layout.addRow("Gaze Y:", self.lbl_gaze_y)
-        panel_layout.addRow("Pupil Dilation:", self.lbl_pupil)
-        panel_layout.addRow("Blink Rate (/min):", self.lbl_blink)
-
-        layout.addWidget(panel, stretch=1)
-        return tab
-
-    def _build_calibration_tab(self) -> QWidget:
-        """Tworzy zakładkę kalibracji 9-punktowej."""
-        tab = QWidget()
-        root = QVBoxLayout(tab)
-
-        info = QLabel(
-            "9-point calibration:\n"
-            "Kliknij Start Calibration i patrz kolejno na punkty.\n"
-            "Wersja bazowa: próbki dla punktów są zbierane z aktualnego gaze vector."
+    def start(self) -> None:
+        self._is_running = True
+        self.status_changed.emit("Tracking started in stub mode.")
+        self.metrics_ready.emit(
+            {
+                "gaze_x": 0.0,
+                "gaze_y": 0.0,
+                "pupil_dilation": 0.0,
+                "blink_rate": 0.0,
+                "tracking_ready": False,
+                "blink_detected": False,
+            }
         )
-        info.setWordWrap(True)
-        root.addWidget(info)
 
-        # Przyciski sterujące kalibracją.
-        buttons_layout = QHBoxLayout()
-        self.btn_start_calib = QPushButton("Start Calibration")
-        self.btn_save_calib = QPushButton("Save Calibration")
-        self.btn_load_calib = QPushButton("Load Calibration")
+    def stop(self) -> None:
+        self._is_running = False
+        self.status_changed.emit("Tracking stopped.")
 
-        self.btn_start_calib.clicked.connect(self._run_calibration_template)
-        self.btn_save_calib.clicked.connect(self._save_calibration_yaml)
-        self.btn_load_calib.clicked.connect(self._load_calibration_yaml)
-
-        buttons_layout.addWidget(self.btn_start_calib)
-        buttons_layout.addWidget(self.btn_save_calib)
-        buttons_layout.addWidget(self.btn_load_calib)
-        root.addLayout(buttons_layout)
-
-        # Podgląd statusu.
-        self.lbl_calib_status = QLabel("Calibration status: not calibrated")
-        root.addWidget(self.lbl_calib_status)
-
-        return tab
-
-    def _build_recording_tab(self) -> QWidget:
-        """Tworzy zakładkę nagrywania i eksportu danych."""
-        tab = QWidget()
-        root = QVBoxLayout(tab)
-
-        form_box = QGroupBox("Session Settings")
-        form_layout = QGridLayout(form_box)
-
-        self.session_name_input = QLineEdit()
-        self.session_name_input.setPlaceholderText("e.g. participant_001_taskA")
-        form_layout.addWidget(QLabel("Session Name:"), 0, 0)
-        form_layout.addWidget(self.session_name_input, 0, 1)
-
-        self.btn_record = QPushButton("Start Record")
-        self.btn_record.clicked.connect(self._toggle_recording)
-        form_layout.addWidget(self.btn_record, 1, 0, 1, 2)
-
-        self.btn_export_csv = QPushButton("Export CSV")
-        self.btn_export_json = QPushButton("Export JSON")
-        self.btn_export_csv.clicked.connect(self._export_csv)
-        self.btn_export_json.clicked.connect(self._export_json)
-        form_layout.addWidget(self.btn_export_csv, 2, 0)
-        form_layout.addWidget(self.btn_export_json, 2, 1)
-
-        root.addWidget(form_box)
-
-        self.lbl_recording_status = QLabel("Recording: OFF")
-        root.addWidget(self.lbl_recording_status)
-
-        return tab
-
-    def _start_tracker(self) -> None:
-        """Uruchamia wątek śledzenia kamery."""
-        self.tracker_thread = TrackerThread(camera_index=0, calibration_model=self.calibration_model)
-        self.tracker_thread.frame_ready.connect(self._on_frame_ready)
-        self.tracker_thread.metrics_ready.connect(self._on_metrics_ready)
-        self.tracker_thread.start()
-
-    def _on_frame_ready(self, image: QImage) -> None:
-        """Odbiera klatkę z trackera i aktualizuje QLabel."""
-        self.video_label.setPixmap(QPixmap.fromImage(image))
-
-    def _on_metrics_ready(self, sample: GazeSample) -> None:
-        """Aktualizuje metryki UI i ewentualnie zapisuje próbkę do sesji."""
-        self.lbl_gaze_x.setText(f"{sample.gaze_x:.3f}")
-        self.lbl_gaze_y.setText(f"{sample.gaze_y:.3f}")
-        self.lbl_pupil.setText(f"{sample.pupil_dilation:.3f}")
-        self.lbl_blink.setText(f"{sample.blink_rate:.1f}")
-
-        if self.recording_enabled:
-            self.recorded_samples.append(sample)
-
-    def _run_calibration_template(self) -> None:
-        """
-        Szablon kalibracji 9-punktowej.
-
-        W produkcji: prezentuj punkt na ekranie -> zbieraj N próbek landmark vector
-        -> uśrednij -> dodaj do datasetu -> fit transform.
-        """
-        if not self.tracker_thread:
-            QMessageBox.warning(self, "Calibration", "Tracker is not running.")
-            return
-
-        # 9 punktów w układzie znormalizowanym (0..1, 0..1).
-        points_screen = [
-            (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
-            (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
-            (0.1, 0.9), (0.5, 0.9), (0.9, 0.9),
-        ]
-
-        eye_vectors = []
-        for _pt in points_screen:
-            # Uproszczenie MVP: pobieramy ostatni vector trackera.
-            vec = self.tracker_thread.get_latest_eye_vector()
-            if vec is None:
-                QMessageBox.warning(self, "Calibration", "No eye vector available.")
-                return
-            eye_vectors.append(vec)
-
-        self.calibration_model.fit(
-            eye_vectors=eye_vectors,
-            screen_points=points_screen,
-            camera_resolution=self.tracker_thread.camera_resolution,
+    def start_recording(self, session_name: str, export_path: Optional[str] = None) -> None:
+        self._is_recording = True
+        self.recording_state_changed.emit(True)
+        self.status_changed.emit(
+            f"Recording requested for session '{session_name}' (stub mode)."
         )
-        self.lbl_calib_status.setText("Calibration status: calibrated")
-        QMessageBox.information(self, "Calibration", "9-point calibration completed (template).")
 
-    def _save_calibration_yaml(self) -> None:
-        """Zapisuje kalibrację do pliku YAML."""
-        if not self.calibration_model.is_fitted:
-            QMessageBox.warning(self, "Calibration", "Model is not calibrated yet.")
-            return
+    def stop_recording(self) -> None:
+        self._is_recording = False
+        self.recording_state_changed.emit(False)
+        self.status_changed.emit("Recording stopped.")
 
-        default_name = f"calibration_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.yaml"
+    def save_calibration(self, path: str) -> None:
+        Path(path).write_text(
+            "timestamp: null\n"
+            "camera_resolution: [0, 0]\n"
+            "transformation_matrix: []\n",
+            encoding="utf-8",
+        )
+        self.status_changed.emit(f"Calibration placeholder saved to {path}")
+
+    def load_calibration(self, path: str) -> dict[str, Any]:
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "camera_resolution": [0, 0],
+            "transformation_matrix": [],
+        }
+        self.calibration_loaded.emit(payload)
+        self.status_changed.emit(f"Calibration placeholder loaded from {path}")
+        return payload
+
+    def begin_calibration(self) -> None:
+        self.status_changed.emit("Calibration requested (stub mode).")
+
+    def shutdown(self) -> None:
+        self.stop()
+        if self._is_recording:
+            self.stop_recording()
+
+
+def make_tracker_controller(parent: Optional[QWidget] = None) -> QWidget:
+    """Create the real backend controller when available, otherwise a stub."""
+
+    if TrackerController is not None:
+        try:
+            return TrackerController(parent=parent)
+        except TypeError:
+            return TrackerController()
+    return StubTrackerController()
+
+
+class VideoFrameLabel(QLabel):
+    """Scaled video surface with a neutral placeholder appearance."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(960, 540)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setObjectName("videoFrameLabel")
+        self.set_placeholder_text("Camera preview will appear here")
+
+    def set_placeholder_text(self, text: str) -> None:
+        self.setText(text)
+        self.setStyleSheet(
+            "QLabel#videoFrameLabel {"
+            "background-color: #111827;"
+            "color: #D1D5DB;"
+            "border: 1px solid #374151;"
+            "font-size: 16px;"
+            "}"
+        )
+
+    def set_frame(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
+        scaled = pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self.pixmap() is not None:
+            scaled = self.pixmap().scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.setPixmap(scaled)
+
+
+class LiveTrackingTab(QWidget):
+    """Primary live tracking workspace with video and telemetry panel."""
+
+    tracking_toggled = pyqtSignal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot = TrackingSnapshot()
+        self.video_label = VideoFrameLabel()
+        self.start_button = QPushButton("Start Tracking")
+        self.stop_button = QPushButton("Stop")
+        self.status_value = QLabel("Idle")
+        self.gaze_x_value = QLabel("0.000")
+        self.gaze_y_value = QLabel("0.000")
+        self.pupil_value = QLabel("0.000")
+        self.blink_rate_value = QLabel("0.00 blinks/min")
+        self.blink_flag_value = QLabel("No")
+        self.tracking_flag_value = QLabel("No")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QHBoxLayout(self)
+        controls = self._build_metrics_panel()
+
+        self.start_button.clicked.connect(lambda: self.tracking_toggled.emit(True))
+        self.stop_button.clicked.connect(lambda: self.tracking_toggled.emit(False))
+        self.stop_button.setEnabled(False)
+
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(self.video_label, stretch=1)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.start_button)
+        button_row.addWidget(self.stop_button)
+        button_row.addStretch(1)
+        left_panel.addLayout(button_row)
+
+        root.addLayout(left_panel, stretch=5)
+        root.addWidget(controls, stretch=2)
+
+    def _build_metrics_panel(self) -> QWidget:
+        panel = QGroupBox("Live Parameters")
+        layout = QFormLayout(panel)
+        layout.addRow("Tracker Status", self.status_value)
+        layout.addRow("Gaze X", self.gaze_x_value)
+        layout.addRow("Gaze Y", self.gaze_y_value)
+        layout.addRow("Pupil Dilation", self.pupil_value)
+        layout.addRow("Blink Rate", self.blink_rate_value)
+        layout.addRow("Blink Detected", self.blink_flag_value)
+        layout.addRow("Tracking Ready", self.tracking_flag_value)
+        return panel
+
+    def set_running_state(self, is_running: bool) -> None:
+        self.start_button.setEnabled(not is_running)
+        self.stop_button.setEnabled(is_running)
+        self.status_value.setText("Running" if is_running else "Idle")
+
+    def update_status(self, status: str) -> None:
+        self.status_value.setText(status)
+
+    def update_frame(self, image: QImage) -> None:
+        self.video_label.set_frame(image)
+
+    def update_metrics(self, metrics: dict[str, Any]) -> None:
+        self.snapshot = TrackingSnapshot(
+            gaze_x=float(metrics.get("gaze_x", 0.0)),
+            gaze_y=float(metrics.get("gaze_y", 0.0)),
+            pupil_dilation=float(metrics.get("pupil_dilation", 0.0)),
+            blink_rate=float(metrics.get("blink_rate", 0.0)),
+            tracking_ready=bool(metrics.get("tracking_ready", False)),
+            blink_detected=bool(metrics.get("blink_detected", False)),
+        )
+        self.gaze_x_value.setText(f"{self.snapshot.gaze_x:.3f}")
+        self.gaze_y_value.setText(f"{self.snapshot.gaze_y:.3f}")
+        self.pupil_value.setText(f"{self.snapshot.pupil_dilation:.3f}")
+        self.blink_rate_value.setText(f"{self.snapshot.blink_rate:.2f} blinks/min")
+        self.blink_flag_value.setText("Yes" if self.snapshot.blink_detected else "No")
+        self.tracking_flag_value.setText("Yes" if self.snapshot.tracking_ready else "No")
+
+
+class CalibrationPreview(QWidget):
+    """Simple preview widget for the 3x3 calibration target layout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(240)
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0F172A"))
+
+        pen = QPen(QColor("#60A5FA"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+
+        radius = 10
+        width = self.width()
+        height = self.height()
+        xs = [0.1, 0.5, 0.9]
+        ys = [0.1, 0.5, 0.9]
+
+        for y in ys:
+            for x in xs:
+                cx = int(width * x)
+                cy = int(height * y)
+                painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
+                painter.drawLine(cx - 16, cy, cx + 16, cy)
+                painter.drawLine(cx, cy - 16, cx, cy + 16)
+
+
+class CalibrationTab(QWidget):
+    """Calibration controls and persistence actions."""
+
+    start_calibration_requested = pyqtSignal()
+    save_calibration_requested = pyqtSignal(str)
+    load_calibration_requested = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_label = QLabel("Calibration not started.")
+        self.metadata_text = QTextEdit()
+        self.metadata_text.setReadOnly(True)
+        self.preview = CalibrationPreview()
+        self.start_button = QPushButton("Start Calibration")
+        self.save_button = QPushButton("Save Calibration")
+        self.load_button = QPushButton("Load Calibration")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        info_box = QGroupBox("9-Point Calibration")
+        info_layout = QVBoxLayout(info_box)
+        info_layout.addWidget(
+            QLabel(
+                "Run a fullscreen 3x3 target routine and map eye features to screen "
+                "coordinates using the backend calibration model."
+            )
+        )
+        info_layout.addWidget(self.preview)
+        info_layout.addWidget(self.status_label)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.start_button)
+        button_row.addWidget(self.save_button)
+        button_row.addWidget(self.load_button)
+        button_row.addStretch(1)
+        info_layout.addLayout(button_row)
+
+        metadata_box = QGroupBox("Calibration Metadata")
+        metadata_layout = QVBoxLayout(metadata_box)
+        metadata_layout.addWidget(self.metadata_text)
+
+        layout.addWidget(info_box)
+        layout.addWidget(metadata_box)
+
+        self.start_button.clicked.connect(self.start_calibration_requested.emit)
+        self.save_button.clicked.connect(self._on_save_clicked)
+        self.load_button.clicked.connect(self._on_load_clicked)
+
+    def _on_save_clicked(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Calibration",
-            str(self.calib_dir / default_name),
-            "YAML Files (*.yaml *.yml)",
+            "calibration.yaml",
+            CALIBRATION_FILENAME_FILTER,
         )
-        if not path:
-            return
+        if path:
+            self.save_calibration_requested.emit(path)
 
-        self.calibration_model.save_yaml(path)
-        QMessageBox.information(self, "Calibration", f"Saved to:\n{path}")
-
-    def _load_calibration_yaml(self) -> None:
-        """Wczytuje kalibrację z YAML."""
+    def _on_load_clicked(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load Calibration",
-            str(self.calib_dir),
-            "YAML Files (*.yaml *.yml)",
+            "",
+            CALIBRATION_FILENAME_FILTER,
         )
-        if not path:
-            return
+        if path:
+            self.load_calibration_requested.emit(path)
 
-        self.calibration_model.load_yaml(path)
-        self.lbl_calib_status.setText("Calibration status: loaded")
-        QMessageBox.information(self, "Calibration", f"Loaded from:\n{path}")
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
 
-    def _toggle_recording(self) -> None:
-        """Włącza/wyłącza nagrywanie próbek gaze."""
-        self.recording_enabled = not self.recording_enabled
-        if self.recording_enabled:
-            self.recorded_samples.clear()
-            self.btn_record.setText("Stop Record")
-            self.lbl_recording_status.setText("Recording: ON")
-        else:
-            self.btn_record.setText("Start Record")
-            self.lbl_recording_status.setText(f"Recording: OFF (samples={len(self.recorded_samples)})")
+    def update_metadata(self, payload: dict[str, Any]) -> None:
+        timestamp = payload.get("timestamp", "n/a")
+        resolution = payload.get("camera_resolution", "n/a")
+        matrix = payload.get("transformation_matrix", [])
+        self.metadata_text.setPlainText(
+            f"timestamp: {timestamp}\n"
+            f"camera_resolution: {resolution}\n"
+            f"transformation_matrix: {matrix}\n"
+        )
 
-    def _session_basename(self) -> str:
-        """Zwraca bezpieczną nazwę sesji."""
-        raw = self.session_name_input.text().strip()
-        if not raw:
-            raw = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-        return "".join(ch for ch in raw if ch.isalnum() or ch in ("-", "_"))
 
-    def _export_csv(self) -> None:
-        """Eksportuje nagrane dane do CSV."""
-        if not self.recorded_samples:
-            QMessageBox.warning(self, "Export CSV", "No data recorded.")
-            return
+class RecordingTab(QWidget):
+    """Session recording controls and export information."""
 
-        out_path = self.session_dir / f"{self._session_basename()}.csv"
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["timestamp", "gaze_x", "gaze_y", "pupil_dilation", "blink_rate", "eye_vector"]
+    recording_toggled = pyqtSignal(bool, str, str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_name_edit = QLineEdit(datetime.now().strftime("session_%Y%m%d_%H%M%S"))
+        self.export_path_edit = QLineEdit()
+        self.record_button = QPushButton("Record")
+        self.stop_button = QPushButton("Stop Recording")
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        config_box = QGroupBox("Session Export")
+        form = QGridLayout(config_box)
+        browse_button = QPushButton("Browse")
+        form.addWidget(QLabel("Session Name"), 0, 0)
+        form.addWidget(self.session_name_edit, 0, 1, 1, 2)
+        form.addWidget(QLabel("Export Path"), 1, 0)
+        form.addWidget(self.export_path_edit, 1, 1)
+        form.addWidget(browse_button, 1, 2)
+        form.addWidget(self.record_button, 2, 1)
+        form.addWidget(self.stop_button, 2, 2)
+
+        log_box = QGroupBox("Recording Log")
+        log_layout = QVBoxLayout(log_box)
+        log_layout.addWidget(self.log_output)
+
+        layout.addWidget(config_box)
+        layout.addWidget(log_box)
+
+        self.stop_button.setEnabled(False)
+        browse_button.clicked.connect(self._choose_export_path)
+        self.record_button.clicked.connect(self._emit_record_start)
+        self.stop_button.clicked.connect(self._emit_record_stop)
+
+    def _choose_export_path(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select Export Path",
+            "gaze_recording.csv",
+            EXPORT_FILENAME_FILTER,
+        )
+        if path:
+            self.export_path_edit.setText(path)
+
+    def _emit_record_start(self) -> None:
+        self.recording_toggled.emit(
+            True,
+            self.session_name_edit.text().strip(),
+            self.export_path_edit.text().strip(),
+        )
+
+    def _emit_record_stop(self) -> None:
+        self.recording_toggled.emit(
+            False,
+            self.session_name_edit.text().strip(),
+            self.export_path_edit.text().strip(),
+        )
+
+    def set_recording_state(self, is_recording: bool) -> None:
+        self.record_button.setEnabled(not is_recording)
+        self.stop_button.setEnabled(is_recording)
+
+    def append_log(self, text: str) -> None:
+        self.log_output.append(text)
+
+
+class MainWindow(QMainWindow):
+    """Top-level application shell with tabbed navigation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tracker = make_tracker_controller(self)
+        self.tabs = QTabWidget()
+        self.live_tab = LiveTrackingTab()
+        self.calibration_tab = CalibrationTab()
+        self.recording_tab = RecordingTab()
+        self._setup_window()
+        self._build_tabs()
+        self._build_menu()
+        self._connect_signals()
+
+    def _setup_window(self) -> None:
+        self.setWindowTitle(APP_NAME)
+        self.resize(*DEFAULT_WINDOW_SIZE)
+        self.setCentralWidget(self.tabs)
+        self.setStatusBar(QStatusBar(self))
+        self.statusBar().showMessage("Ready")
+
+    def _build_tabs(self) -> None:
+        self.tabs.addTab(self.live_tab, "Live Tracking")
+        self.tabs.addTab(self.calibration_tab, "Calibration")
+        self.tabs.addTab(self.recording_tab, "Recording & Export")
+
+        for title in (
+            "Heatmap Generator",
+            "Area of Interest (AOI) Editor",
+            "External Hardware Sync (EEG/HRM)",
+        ):
+            placeholder = self._make_disabled_placeholder(title)
+            index = self.tabs.addTab(placeholder, title)
+            self.tabs.setTabEnabled(index, False)
+
+    def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("File")
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        tracking_menu = self.menuBar().addMenu("Tracking")
+        start_action = QAction("Start", self)
+        stop_action = QAction("Stop", self)
+        start_action.triggered.connect(lambda: self._handle_tracking_toggle(True))
+        stop_action.triggered.connect(lambda: self._handle_tracking_toggle(False))
+        tracking_menu.addAction(start_action)
+        tracking_menu.addAction(stop_action)
+
+    def _make_disabled_placeholder(self, title: str) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        label = QLabel(f"{title} is reserved for future expansion.")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(1)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        return widget
+
+    def _connect_signals(self) -> None:
+        self.live_tab.tracking_toggled.connect(self._handle_tracking_toggle)
+        self.calibration_tab.start_calibration_requested.connect(self._handle_calibration_start)
+        self.calibration_tab.save_calibration_requested.connect(self._handle_calibration_save)
+        self.calibration_tab.load_calibration_requested.connect(self._handle_calibration_load)
+        self.recording_tab.recording_toggled.connect(self._handle_recording_toggle)
+
+        self.tracker.frame_ready.connect(self.live_tab.update_frame)
+        self.tracker.metrics_ready.connect(self.live_tab.update_metrics)
+        self.tracker.status_changed.connect(self._broadcast_status)
+        self.tracker.recording_state_changed.connect(self.recording_tab.set_recording_state)
+        self.tracker.calibration_loaded.connect(self.calibration_tab.update_metadata)
+
+    def _broadcast_status(self, status: str) -> None:
+        self.statusBar().showMessage(status)
+        self.live_tab.update_status(status)
+        self.recording_tab.append_log(status)
+        self.calibration_tab.set_status(status)
+
+    def _handle_tracking_toggle(self, should_start: bool) -> None:
+        try:
+            if should_start:
+                self.tracker.start()
+            else:
+                self.tracker.stop()
+            self.live_tab.set_running_state(should_start)
+        except Exception as exc:  # pragma: no cover - defensive UI boundary
+            self._show_error("Tracking Error", str(exc))
+
+    def _handle_calibration_start(self) -> None:
+        try:
+            self.tracker.begin_calibration()
+            self.calibration_tab.set_status(
+                "Fullscreen calibration requested. Follow on-screen targets."
             )
-            for s in self.recorded_samples:
-                writer.writerow(
-                    [s.timestamp, s.gaze_x, s.gaze_y, s.pupil_dilation, s.blink_rate, list(s.eye_vector)]
-                )
+        except Exception as exc:  # pragma: no cover - defensive UI boundary
+            self._show_error("Calibration Error", str(exc))
 
-        QMessageBox.information(self, "Export CSV", f"Saved:\n{out_path}")
+    def _handle_calibration_save(self, path: str) -> None:
+        try:
+            self.tracker.save_calibration(path)
+            self.calibration_tab.set_status(f"Calibration saved to: {path}")
+        except Exception as exc:  # pragma: no cover - defensive UI boundary
+            self._show_error("Save Calibration Error", str(exc))
 
-    def _export_json(self) -> None:
-        """Eksportuje nagrane dane do JSON."""
-        if not self.recorded_samples:
-            QMessageBox.warning(self, "Export JSON", "No data recorded.")
+    def _handle_calibration_load(self, path: str) -> None:
+        try:
+            payload = self.tracker.load_calibration(path)
+            if isinstance(payload, dict):
+                self.calibration_tab.update_metadata(payload)
+            self.calibration_tab.set_status(f"Calibration loaded from: {path}")
+        except Exception as exc:  # pragma: no cover - defensive UI boundary
+            self._show_error("Load Calibration Error", str(exc))
+
+    def _handle_recording_toggle(
+        self,
+        should_record: bool,
+        session_name: str,
+        export_path: str,
+    ) -> None:
+        if not session_name:
+            self._show_error("Invalid Session", "Session name cannot be empty.")
             return
 
-        out_path = self.session_dir / f"{self._session_basename()}.json"
-        payload = [
-            {
-                "timestamp": s.timestamp,
-                "gaze_x": s.gaze_x,
-                "gaze_y": s.gaze_y,
-                "pupil_dilation": s.pupil_dilation,
-                "blink_rate": s.blink_rate,
-                "eye_vector": list(s.eye_vector),
-            }
-            for s in self.recorded_samples
-        ]
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        try:
+            if should_record:
+                self.tracker.start_recording(session_name, export_path or None)
+            else:
+                self.tracker.stop_recording()
+        except Exception as exc:  # pragma: no cover - defensive UI boundary
+            self._show_error("Recording Error", str(exc))
 
-        QMessageBox.information(self, "Export JSON", f"Saved:\n{out_path}")
+    def _show_error(self, title: str, message: str) -> None:
+        QMessageBox.critical(self, title, message)
+        self.statusBar().showMessage(f"{title}: {message}")
 
-    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming convention)
-        """Sprzątanie wątku trackera przy zamknięciu aplikacji."""
-        if self.tracker_thread:
-            self.tracker_thread.stop()
-            self.tracker_thread.wait(2000)
+    def closeEvent(self, event: Any) -> None:  # noqa: N802
+        shutdown = getattr(self.tracker, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
         super().closeEvent(event)
 
 
-def main() -> None:
-    """Uruchamia aplikację desktopową."""
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+def configure_application() -> QApplication:
+    """Create and configure the QApplication instance."""
 
-    # Tworzymy okno główne.
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName(APP_ORG)
+    app.setStyle("Fusion")
+    return app
+
+
+def main() -> int:
+    """Run the desktop application."""
+
+    app = configure_application()
     window = MainWindow()
     window.show()
-
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
