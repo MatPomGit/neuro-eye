@@ -1,0 +1,5 @@
+yqt6
+opencv-python
+mediapipe
+numpy
+pyyaml
