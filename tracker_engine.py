@@ -15,8 +15,10 @@ working interface and degrades gracefully with informative status messages.
 from __future__ import annotations
 
 import csv
+import glob
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -38,6 +40,14 @@ try:
     import mediapipe as mp
 except ImportError:  # pragma: no cover - environment dependent
     mp = None
+
+try:
+    if mp is not None and hasattr(mp, "solutions"):
+        MP_FACE_MESH = mp.solutions.face_mesh
+    else:
+        from mediapipe.python.solutions import face_mesh as MP_FACE_MESH  # type: ignore
+except Exception:  # pragma: no cover - environment dependent
+    MP_FACE_MESH = None
 
 
 DEFAULT_CAMERA_INDEX = 0
@@ -502,7 +512,7 @@ class CameraWorker(QObject):
             self.finished.emit()
             return
 
-        cap = cv2.VideoCapture(self.camera_index)
+        cap = self._open_capture(self.camera_index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_resolution[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_resolution[1])
         cap.set(cv2.CAP_PROP_FPS, self.camera_fps)
@@ -512,17 +522,22 @@ class CameraWorker(QObject):
             self.finished.emit()
             return
 
-        if mp is None:
-            self.status_changed.emit("MediaPipe not available. Running preview-only camera mode.")
+        if MP_FACE_MESH is None:
+            self.status_changed.emit("MediaPipe Face Mesh not available. Running preview-only camera mode.")
             self._run_preview_only(cap)
             return
 
-        face_mesh = mp.solutions.face_mesh.FaceMesh(
+        try:
+            face_mesh = MP_FACE_MESH.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+        except Exception as exc:
+            self.status_changed.emit(f"Failed to initialize MediaPipe Face Mesh: {exc}")
+            self._run_preview_only(cap)
+            return
 
         self.status_changed.emit(
             "Camera worker started "
@@ -542,8 +557,15 @@ class CameraWorker(QObject):
                 frame_counter += 1
                 should_process = ((frame_counter - 1) % self.tracking_stride) == 0
                 if should_process or last_results is None:
-                    last_results = face_mesh.process(image_rgb)
-                    last_metrics = self._build_metrics(image_rgb, last_results)
+                    try:
+                        last_results = face_mesh.process(image_rgb)
+                        last_metrics = self._build_metrics(image_rgb, last_results)
+                    except Exception as exc:
+                        self.status_changed.emit(f"MediaPipe processing error: {exc}")
+                        last_results = None
+                        last_metrics = FrameMetrics(
+                            timestamp=datetime.now().isoformat(timespec="milliseconds")
+                        )
                     metrics = last_metrics
                 else:
                     if last_metrics is None:
@@ -558,11 +580,24 @@ class CameraWorker(QObject):
                 rendered = self._draw_overlay(image_rgb.copy(), last_results, metrics)
                 self.frame_ready.emit(self._to_qimage(rendered))
                 self.metrics_ready.emit(asdict(metrics))
+        except Exception as exc:
+            self.status_changed.emit(f"Camera worker crashed: {exc}")
         finally:
-            face_mesh.close()
+            try:
+                face_mesh.close()
+            except Exception:
+                pass
             cap.release()
             self.status_changed.emit("Camera worker stopped.")
             self.finished.emit()
+
+    @staticmethod
+    def _open_capture(camera_index: int) -> Any:
+        if cv2 is None:
+            return None
+        if os.name == "posix" and hasattr(cv2, "CAP_V4L2"):
+            return cv2.VideoCapture(int(camera_index), cv2.CAP_V4L2)
+        return cv2.VideoCapture(int(camera_index))
 
     def _run_preview_only(self, cap: Any) -> None:
         try:
