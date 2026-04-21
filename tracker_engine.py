@@ -140,6 +140,8 @@ class CalibrationData:
     transformation_matrix: list[list[float]]
     target_layout: list[list[float]]
     validation_error_px: Optional[float] = None
+    feature_mean: Optional[list[float]] = None
+    feature_std: Optional[list[float]] = None
 
 
 class CalibrationStorage:
@@ -325,6 +327,9 @@ class CalibrationModel:
         self.coefficients: Optional[np.ndarray] = None
         self.target_layout = self.default_target_layout()
         self.validation_error_px: Optional[float] = None
+        self.feature_mean = np.zeros(6, dtype=np.float64)
+        self.feature_std = np.ones(6, dtype=np.float64)
+        self._ridge_lambda = 1e-3
 
     @staticmethod
     def default_target_layout() -> list[list[float]]:
@@ -335,7 +340,7 @@ class CalibrationModel:
         ]
 
     @staticmethod
-    def expand_features(features: Iterable[float]) -> np.ndarray:
+    def _legacy_expand_features(features: Iterable[float]) -> np.ndarray:
         f = np.asarray(list(features), dtype=np.float64)
         if f.size != 6:
             raise ValueError("Calibration model expects exactly 6 features.")
@@ -350,16 +355,60 @@ class CalibrationModel:
             dtype=np.float64,
         )
 
+    @staticmethod
+    def expand_features(features: Iterable[float]) -> np.ndarray:
+        """Rozszerza cechy do wielomianu 2. rzędu z pełnym zestawem interakcji."""
+        f = np.asarray(list(features), dtype=np.float64)
+        if f.size != 6:
+            raise ValueError("Calibration model expects exactly 6 features.")
+        terms: list[float] = [1.0]
+        terms.extend(f.tolist())
+        terms.extend((f * f).tolist())
+        # Interakcje między wszystkimi parami cech poprawiają korekcję paralaksy i rotacji głowy.
+        for i in range(f.size):
+            for j in range(i + 1, f.size):
+                terms.append(float(f[i] * f[j]))
+        return np.asarray(terms, dtype=np.float64)
+
+    def _fit_weighted_ridge(
+        self,
+        design: np.ndarray,
+        targets: np.ndarray,
+        weights: np.ndarray,
+    ) -> np.ndarray:
+        """Dopasowuje model ważoną regresją grzbietową (stabilniejszą numerycznie)."""
+        xtwx = design.T @ (weights[:, None] * design)
+        reg = np.eye(design.shape[1], dtype=np.float64) * self._ridge_lambda
+        reg[0, 0] = 0.0  # Wyraz wolny nie powinien być tłumiony regularizacją.
+        xtwy = design.T @ (weights[:, None] * targets)
+        return np.linalg.pinv(xtwx + reg) @ xtwy
+
     def fit(self, samples: list[CalibrationSample], screen_size: tuple[int, int]) -> CalibrationData:
         if len(samples) < 9:
             raise ValueError("At least 9 calibration samples are required.")
 
-        design = np.vstack([self.expand_features(sample.features) for sample in samples])
+        raw_features = np.asarray([sample.features for sample in samples], dtype=np.float64)
+        self.feature_mean = raw_features.mean(axis=0)
+        self.feature_std = raw_features.std(axis=0)
+        self.feature_std = np.clip(self.feature_std, 1e-4, None)
+        normalized = (raw_features - self.feature_mean) / self.feature_std
+
+        design = np.vstack([self.expand_features(row) for row in normalized])
         targets = np.asarray(
             [[sample.target_x * screen_size[0], sample.target_y * screen_size[1]] for sample in samples],
             dtype=np.float64,
         )
-        coefficients, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
+        weights = np.ones(design.shape[0], dtype=np.float64)
+        coefficients = self._fit_weighted_ridge(design, targets, weights)
+
+        # Iteracyjna redukcja wpływu odchyleń (np. mrugnięcie w trakcie jednego punktu kalibracji).
+        for _ in range(4):
+            residual = np.linalg.norm((design @ coefficients) - targets, axis=1)
+            median_residual = float(np.median(residual))
+            scale = max(1.4826 * median_residual, 1.0)
+            huber_limit = 1.5 * scale
+            weights = np.where(residual <= huber_limit, 1.0, huber_limit / np.maximum(residual, 1e-6))
+            coefficients = self._fit_weighted_ridge(design, targets, weights)
         self.coefficients = coefficients
 
         predictions = design @ coefficients
@@ -370,10 +419,12 @@ class CalibrationModel:
             timestamp=datetime.now().isoformat(timespec="seconds"),
             camera_resolution=[screen_size[0], screen_size[1]],
             feature_names=self.FEATURE_NAMES,
-            model_type="polynomial_regression_order_2",
+            model_type="polynomial_regression_order_2_normalized_huber_ridge",
             transformation_matrix=coefficients.tolist(),
             target_layout=self.target_layout,
             validation_error_px=self.validation_error_px,
+            feature_mean=self.feature_mean.tolist(),
+            feature_std=self.feature_std.tolist(),
         )
 
     def load_from_dict(self, payload: dict[str, Any]) -> None:
@@ -381,11 +432,21 @@ class CalibrationModel:
         self.coefficients = np.asarray(matrix, dtype=np.float64) if matrix else None
         self.validation_error_px = payload.get("validation_error_px")
         self.target_layout = payload.get("target_layout", self.default_target_layout())
+        mean = payload.get("feature_mean")
+        std = payload.get("feature_std")
+        self.feature_mean = np.asarray(mean, dtype=np.float64) if mean else np.zeros(6, dtype=np.float64)
+        self.feature_std = np.asarray(std, dtype=np.float64) if std else np.ones(6, dtype=np.float64)
+        self.feature_std = np.clip(self.feature_std, 1e-4, None)
 
     def map_to_screen(self, features: list[float], screen_size: tuple[int, int]) -> tuple[float, float, bool]:
         if self.coefficients is None:
             return 0.0, 0.0, False
-        expanded = self.expand_features(features)
+        if self.coefficients.shape[0] == 20:
+            # Kompatybilność z wcześniejszymi kalibracjami zapisanymi w starym formacie.
+            expanded = self._legacy_expand_features(features)
+        else:
+            normalized = (np.asarray(features, dtype=np.float64) - self.feature_mean) / self.feature_std
+            expanded = self.expand_features(normalized)
         output = expanded @ self.coefficients
         width, height = screen_size
         x = float(np.clip(output[0], 0, width))
