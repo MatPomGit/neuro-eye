@@ -14,8 +14,7 @@ The recommended environment is the pinned Conda setup below.
 conda env remove -n eye-tracking-research -y
 conda env config vars set QT_QPA_PLATFORM=xcb
 conda env create -f environment.yml
-conda activate eye-tracking-research
-python main.py
+./run_app.sh
 ```
 
 ## Verify MediaPipe

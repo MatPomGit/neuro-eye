@@ -74,6 +74,9 @@ MP_FACE_MESH, MP_FACE_MESH_ERROR = _resolve_mediapipe_face_mesh()
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_CAMERA_RESOLUTION = (1280, 720)
 DEFAULT_CAMERA_FPS = 30.0
+DATA_DIR = Path("data")
+SESSIONS_DIR = DATA_DIR / "sessions"
+CALIBRATIONS_DIR = DATA_DIR / "calibrations"
 
 
 def _candidate_camera_indices(max_indices: int = 6) -> list[int]:
@@ -175,7 +178,7 @@ class RecordingWriter:
             self._export_path = Path(export_path)
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._export_path = Path.cwd() / f"{session_name}_{timestamp}.csv"
+            self._export_path = SESSIONS_DIR / f"{session_name}_{timestamp}.csv"
         self._rows = []
         self._is_recording = True
         return str(self._export_path)

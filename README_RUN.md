@@ -4,8 +4,7 @@ Skrót:
 
 ```bash
 conda env create -f environment.yml
-conda activate eye-tracking-research
-python main.py
+./run_app.sh
 ```
 
 Pełna dokumentacja jest w `README.md`.

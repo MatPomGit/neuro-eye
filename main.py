@@ -56,6 +56,9 @@ APP_ORG = "PCDB"
 DEFAULT_WINDOW_SIZE = (1440, 900)
 CALIBRATION_FILENAME_FILTER = "YAML Files (*.yaml *.yml)"
 EXPORT_FILENAME_FILTER = "CSV Files (*.csv);;JSON Files (*.json)"
+DATA_DIR = Path("data")
+SESSIONS_DIR = DATA_DIR / "sessions"
+CALIBRATIONS_DIR = DATA_DIR / "calibrations"
 
 
 @dataclass(slots=True)
@@ -120,7 +123,9 @@ class StubTrackerController(QWidget):
         self.status_changed.emit("Recording stopped.")
 
     def save_calibration(self, path: str) -> None:
-        Path(path).write_text(
+        calibration_path = Path(path)
+        calibration_path.parent.mkdir(parents=True, exist_ok=True)
+        calibration_path.write_text(
             "timestamp: null\n"
             "camera_resolution: [0, 0]\n"
             "transformation_matrix: []\n",
@@ -490,7 +495,7 @@ class CalibrationTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Calibration",
-            "calibration.yaml",
+            str(CALIBRATIONS_DIR / "calibration.yaml"),
             CALIBRATION_FILENAME_FILTER,
         )
         if path:
@@ -500,7 +505,7 @@ class CalibrationTab(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load Calibration",
-            "",
+            str(CALIBRATIONS_DIR),
             CALIBRATION_FILENAME_FILTER,
         )
         if path:
@@ -565,7 +570,7 @@ class RecordingTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Select Export Path",
-            "gaze_recording.csv",
+            str(SESSIONS_DIR / "gaze_recording.csv"),
             EXPORT_FILENAME_FILTER,
         )
         if path:
@@ -749,6 +754,8 @@ def configure_application() -> QApplication:
 def main() -> int:
     """Run the desktop application."""
 
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    CALIBRATIONS_DIR.mkdir(parents=True, exist_ok=True)
     app = configure_application()
     window = MainWindow()
     window.show()
