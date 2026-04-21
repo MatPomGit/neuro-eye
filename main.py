@@ -409,6 +409,139 @@ class LiveTrackingTab(QWidget):
             self.gaze_focus_chart.append_sample(self.snapshot.gaze_x, self.snapshot.gaze_y)
 
 
+class HeatmapCanvas(QWidget):
+    """Płótno rysujące mapę cieplną na podstawie historii punktów spojrzenia."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._points: deque[tuple[float, float]] = deque(maxlen=3000)
+        self._is_tracking_ready = False
+        self.setMinimumHeight(360)
+
+    def append_gaze_sample(self, gaze_x: float, gaze_y: float, tracking_ready: bool) -> None:
+        """Dopisuje próbkę do mapy cieplnej tylko dla wiarygodnego trackingu."""
+        self._is_tracking_ready = bool(tracking_ready)
+        if not self._is_tracking_ready:
+            self.update()
+            return
+        self._points.append((self._clamp(gaze_x), self._clamp(gaze_y)))
+        self.update()
+
+    def clear_points(self) -> None:
+        """Czyści wszystkie punkty mapy cieplnej."""
+        self._points.clear()
+        self.update()
+
+    def point_count(self) -> int:
+        """Zwraca liczbę próbek aktualnie widocznych na mapie."""
+        return len(self._points)
+
+    @staticmethod
+    def _clamp(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#020617"))
+
+        area = self.rect().adjusted(14, 14, -14, -14)
+        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.setBrush(QColor("#0B1220"))
+        painter.drawRoundedRect(area, 10, 10)
+
+        if not self._points:
+            painter.setPen(QColor("#94A3B8"))
+            painter.drawText(
+                area.adjusted(10, 10, -10, -10),
+                Qt.AlignmentFlag.AlignCenter,
+                "Brak próbek mapy cieplnej.\nUruchom tracking i patrz w ekran.",
+            )
+            return
+
+        # Starsze punkty są słabsze wizualnie, dzięki czemu lepiej widać aktualny obszar fiksacji.
+        total = len(self._points)
+        for index, (x_norm, y_norm) in enumerate(self._points):
+            x_pos = area.left() + x_norm * area.width()
+            y_pos = area.top() + y_norm * area.height()
+
+            age_ratio = (index + 1) / max(total, 1)
+            alpha = int(20 + age_ratio * 175)
+            radius = 5 + int(age_ratio * 10)
+            color = QColor(239, 68, 68, alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(x_pos, y_pos), radius, radius)
+
+        # Jasny marker ostatniego punktu ułatwia lokalizację bieżącego spojrzenia.
+        last_x, last_y = self._points[-1]
+        marker_x = area.left() + last_x * area.width()
+        marker_y = area.top() + last_y * area.height()
+        painter.setPen(QPen(QColor("#F8FAFC"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(marker_x, marker_y), 9, 9)
+
+
+class HeatmapTab(QWidget):
+    """Zakładka generatora mapy cieplnej spojrzenia w czasie rzeczywistym."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.canvas = HeatmapCanvas()
+        self.status_label = QLabel("Oczekiwanie na dane trackingu.")
+        self.sample_count_label = QLabel("Liczba próbek: 0")
+        self.clear_button = QPushButton("Wyczyść mapę")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        title = QLabel("Heatmap Generator")
+        title.setStyleSheet("font-size: 20px; font-weight: 600;")
+        subtitle = QLabel(
+            "Mapa cieplna pokazuje zagęszczenie punktów spojrzenia. "
+            "Jaśniejsze i większe plamy oznaczają częstsze fiksacje."
+        )
+        subtitle.setWordWrap(True)
+        self.status_label.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.canvas, stretch=1)
+        layout.addWidget(self.sample_count_label)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.clear_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+
+        self.clear_button.clicked.connect(self.canvas.clear_points)
+        self.clear_button.clicked.connect(self._refresh_sample_count)
+
+    def update_metrics(self, metrics: dict[str, Any]) -> None:
+        tracking_ready = bool(metrics.get("tracking_ready", False))
+        gaze_x = float(metrics.get("gaze_x", 0.0))
+        gaze_y = float(metrics.get("gaze_y", 0.0))
+        self.canvas.append_gaze_sample(gaze_x, gaze_y, tracking_ready)
+        self._refresh_sample_count()
+
+        if tracking_ready:
+            self.status_label.setText(
+                "Tracking aktywny. Punkty spojrzenia są zapisywane do mapy cieplnej."
+            )
+        else:
+            self.status_label.setText(
+                "Brak stabilnego trackingu. Mapa czeka na wiarygodne próbki."
+            )
+
+    def reset(self) -> None:
+        """Resetuje mapę, np. przy zatrzymaniu trackingu."""
+        self.canvas.clear_points()
+        self._refresh_sample_count()
+        self.status_label.setText("Mapa została wyczyszczona po zatrzymaniu trackingu.")
+
+    def _refresh_sample_count(self) -> None:
+        self.sample_count_label.setText(f"Liczba próbek: {self.canvas.point_count()}")
+
+
 class CalibrationPreview(QWidget):
     """Simple preview widget for the 3x3 calibration target layout."""
 
@@ -774,6 +907,7 @@ class MainWindow(QMainWindow):
         self.live_tab = LiveTrackingTab()
         self.calibration_tab = CalibrationTab()
         self.recording_tab = RecordingTab()
+        self.heatmap_tab = HeatmapTab()
         self.depth_3d_tab = Depth3DTab()
         self._setup_window()
         self._build_tabs()
@@ -791,10 +925,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.live_tab, "Live Tracking")
         self.tabs.addTab(self.calibration_tab, "Calibration")
         self.tabs.addTab(self.recording_tab, "Recording & Export")
+        self.tabs.addTab(self.heatmap_tab, "Heatmap Generator")
         self.tabs.addTab(self.depth_3d_tab, "Głębia 3D")
 
         for title in (
-            "Heatmap Generator",
             "Area of Interest (AOI) Editor",
             "External Hardware Sync (EEG/HRM)",
         ):
@@ -835,6 +969,7 @@ class MainWindow(QMainWindow):
 
         self.tracker.frame_ready.connect(self.live_tab.update_frame)
         self.tracker.metrics_ready.connect(self.live_tab.update_metrics)
+        self.tracker.metrics_ready.connect(self.heatmap_tab.update_metrics)
         self.tracker.metrics_ready.connect(self.depth_3d_tab.update_metrics)
         self.tracker.status_changed.connect(self._broadcast_status)
         self.tracker.recording_state_changed.connect(self.recording_tab.set_recording_state)
@@ -852,6 +987,7 @@ class MainWindow(QMainWindow):
                 self.tracker.start()
             else:
                 self.tracker.stop()
+                self.heatmap_tab.reset()
             self.live_tab.set_running_state(should_start)
         except Exception as exc:  # pragma: no cover - defensive UI boundary
             self._show_error("Tracking Error", str(exc))
