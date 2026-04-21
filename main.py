@@ -34,7 +34,6 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSlider,
     QStatusBar,
     QTabWidget,
     QTextEdit,
@@ -81,7 +80,6 @@ class StubTrackerController(QWidget):
     status_changed = pyqtSignal(str)
     recording_state_changed = pyqtSignal(bool)
     calibration_loaded = pyqtSignal(dict)
-    tracking_stride_changed = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -106,11 +104,6 @@ class StubTrackerController(QWidget):
     def stop(self) -> None:
         self._is_running = False
         self.status_changed.emit("Tracking stopped.")
-
-    def set_tracking_stride(self, stride: int) -> None:
-        stride = max(1, min(int(stride), 3))
-        self.tracking_stride_changed.emit(stride)
-        self.status_changed.emit(f"Tracking frequency changed: MediaPipe every {stride} frame(s).")
 
     def start_recording(self, session_name: str, export_path: Optional[str] = None) -> None:
         self._is_recording = True
@@ -168,6 +161,7 @@ class VideoFrameLabel(QLabel):
 
     def __init__(self) -> None:
         super().__init__()
+        self._source_pixmap = QPixmap()
         self.setMinimumSize(960, 540)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -175,6 +169,8 @@ class VideoFrameLabel(QLabel):
         self.set_placeholder_text("Camera preview will appear here")
 
     def set_placeholder_text(self, text: str) -> None:
+        self._source_pixmap = QPixmap()
+        self.clear()
         self.setText(text)
         self.setStyleSheet(
             "QLabel#videoFrameLabel {"
@@ -187,29 +183,35 @@ class VideoFrameLabel(QLabel):
 
     def set_frame(self, image: QImage) -> None:
         pixmap = QPixmap.fromImage(image)
-        scaled = pixmap.scaled(
-            self.size(),
+        if pixmap.isNull():
+            self.set_placeholder_text("No frame available")
+            return
+        self._source_pixmap = pixmap
+        self._apply_scaled_pixmap()
+
+    def _apply_scaled_pixmap(self) -> None:
+        if self._source_pixmap.isNull():
+            return
+        target_size = self.size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
+        scaled = self._source_pixmap.scaled(
+            target_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        self.setText("")
         self.setPixmap(scaled)
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         super().resizeEvent(event)
-        if self.pixmap() is not None:
-            scaled = self.pixmap().scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.setPixmap(scaled)
+        self._apply_scaled_pixmap()
 
 
 class LiveTrackingTab(QWidget):
     """Primary live tracking workspace with video and telemetry panel."""
 
     tracking_toggled = pyqtSignal(bool)
-    tracking_stride_changed = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -218,14 +220,6 @@ class LiveTrackingTab(QWidget):
         self.start_button = QPushButton("Start Tracking")
         self.stop_button = QPushButton("Stop")
         self.status_value = QLabel("Idle")
-        self.tracking_stride_slider = QSlider(Qt.Orientation.Horizontal)
-        self.tracking_stride_slider.setRange(1, 3)
-        self.tracking_stride_slider.setSingleStep(1)
-        self.tracking_stride_slider.setPageStep(1)
-        self.tracking_stride_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.tracking_stride_slider.setTickInterval(1)
-        self.tracking_stride_slider.setValue(1)
-        self.tracking_stride_value_label = QLabel()
         self.gaze_x_value = QLabel("0.000")
         self.gaze_y_value = QLabel("0.000")
         self.pupil_value = QLabel("0.000")
@@ -240,9 +234,7 @@ class LiveTrackingTab(QWidget):
 
         self.start_button.clicked.connect(lambda: self.tracking_toggled.emit(True))
         self.stop_button.clicked.connect(lambda: self.tracking_toggled.emit(False))
-        self.tracking_stride_slider.valueChanged.connect(self._emit_tracking_stride_change)
         self.stop_button.setEnabled(False)
-        self._update_tracking_stride_label(self.tracking_stride_slider.value())
 
         left_panel = QVBoxLayout()
         left_panel.addWidget(self.video_label, stretch=1)
@@ -260,12 +252,6 @@ class LiveTrackingTab(QWidget):
         panel = QGroupBox("Live Parameters")
         layout = QFormLayout(panel)
         layout.addRow("Tracker Status", self.status_value)
-        stride_widget = QWidget()
-        stride_layout = QHBoxLayout(stride_widget)
-        stride_layout.setContentsMargins(0, 0, 0, 0)
-        stride_layout.addWidget(self.tracking_stride_slider, stretch=1)
-        stride_layout.addWidget(self.tracking_stride_value_label)
-        layout.addRow("MediaPipe Frequency", stride_widget)
         layout.addRow("Gaze X", self.gaze_x_value)
         layout.addRow("Gaze Y", self.gaze_y_value)
         layout.addRow("Pupil Dilation", self.pupil_value)
@@ -273,22 +259,6 @@ class LiveTrackingTab(QWidget):
         layout.addRow("Blink Detected", self.blink_flag_value)
         layout.addRow("Tracking Ready", self.tracking_flag_value)
         return panel
-
-    def _emit_tracking_stride_change(self) -> None:
-        stride = int(self.tracking_stride_slider.value())
-        self._update_tracking_stride_label(stride)
-        self.tracking_stride_changed.emit(stride)
-
-    def set_tracking_stride(self, stride: int) -> None:
-        stride = max(1, min(int(stride), 3))
-        self.tracking_stride_slider.blockSignals(True)
-        self.tracking_stride_slider.setValue(stride)
-        self.tracking_stride_slider.blockSignals(False)
-        self._update_tracking_stride_label(stride)
-
-    def _update_tracking_stride_label(self, stride: int) -> None:
-        label = "Every frame" if stride == 1 else f"Every {stride} frames"
-        self.tracking_stride_value_label.setText(label)
 
     def set_running_state(self, is_running: bool) -> None:
         self.start_button.setEnabled(not is_running)
@@ -569,7 +539,6 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.live_tab.tracking_toggled.connect(self._handle_tracking_toggle)
-        self.live_tab.tracking_stride_changed.connect(self._handle_tracking_stride_change)
         self.calibration_tab.start_calibration_requested.connect(self._handle_calibration_start)
         self.calibration_tab.save_calibration_requested.connect(self._handle_calibration_save)
         self.calibration_tab.load_calibration_requested.connect(self._handle_calibration_load)
@@ -580,8 +549,6 @@ class MainWindow(QMainWindow):
         self.tracker.status_changed.connect(self._broadcast_status)
         self.tracker.recording_state_changed.connect(self.recording_tab.set_recording_state)
         self.tracker.calibration_loaded.connect(self.calibration_tab.update_metadata)
-        if hasattr(self.tracker, "tracking_stride_changed"):
-            self.tracker.tracking_stride_changed.connect(self.live_tab.set_tracking_stride)
 
     def _broadcast_status(self, status: str) -> None:
         self.statusBar().showMessage(status)
@@ -598,14 +565,6 @@ class MainWindow(QMainWindow):
             self.live_tab.set_running_state(should_start)
         except Exception as exc:  # pragma: no cover - defensive UI boundary
             self._show_error("Tracking Error", str(exc))
-
-    def _handle_tracking_stride_change(self, stride: int) -> None:
-        try:
-            setter = getattr(self.tracker, "set_tracking_stride", None)
-            if callable(setter):
-                setter(stride)
-        except Exception as exc:  # pragma: no cover - defensive UI boundary
-            self._show_error("Tracking Settings Error", str(exc))
 
     def _handle_calibration_start(self) -> None:
         try:
