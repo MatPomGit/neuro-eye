@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QMessageBox,
     QPushButton,
+    QSlider,
     QStatusBar,
     QTabWidget,
     QTextEdit,
@@ -742,6 +743,13 @@ class PerspectiveViewport3D(QWidget):
         self._distance_scale = 1.0
         self._tracking_ready = False
         self._distance_baseline: Optional[float] = None
+        # Suwak steruje bazową głębokością obiektu: mniejsza wartość = bliżej użytkownika.
+        self._object_depth = -1.8
+
+    def set_object_depth(self, depth: float) -> None:
+        """Ustawia głębokość obiektu 3D względem ekranu (oś Z, wartości ujemne)."""
+        self._object_depth = float(max(-3.2, min(-0.7, depth)))
+        self.update()
 
     def update_from_metrics(self, metrics: dict[str, Any]) -> None:
         """Aktualizuje parametry kamery na podstawie telemetrii śledzenia."""
@@ -808,7 +816,7 @@ class PerspectiveViewport3D(QWidget):
 
         # Sześcian osadzony "za ekranem", czyli przy ujemnych wartościach Z.
         size = 0.62
-        z_center = -1.8
+        z_center = self._object_depth
         cube_vertices = [
             (-size, -size, z_center - size),
             (size, -size, z_center - size),
@@ -863,6 +871,8 @@ class Depth3DTab(QWidget):
         super().__init__()
         self.viewport = PerspectiveViewport3D()
         self.status_label = QLabel("Uruchom tracking, aby aktywować perspektywę opartą o ruch głowy.")
+        self.depth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.depth_value_label = QLabel("Głębokość obiektu: 50% (poziom domyślny)")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -876,11 +886,37 @@ class Depth3DTab(QWidget):
         )
         subtitle.setWordWrap(True)
         self.status_label.setWordWrap(True)
+        self.depth_value_label.setWordWrap(True)
+
+        self.depth_slider.setRange(0, 100)
+        self.depth_slider.setValue(50)
+        self.depth_slider.setSingleStep(1)
+        self.depth_slider.setPageStep(5)
+        self.depth_slider.valueChanged.connect(self._on_depth_slider_changed)
+
+        slider_row = QHBoxLayout()
+        slider_row.addWidget(QLabel("Bliżej"))
+        slider_row.addWidget(self.depth_slider, stretch=1)
+        slider_row.addWidget(QLabel("Dalej"))
 
         layout.addWidget(title)
         layout.addWidget(subtitle)
+        layout.addLayout(slider_row)
+        layout.addWidget(self.depth_value_label)
         layout.addWidget(self.viewport, stretch=1)
         layout.addWidget(self.status_label)
+        self._on_depth_slider_changed(self.depth_slider.value())
+
+    def _on_depth_slider_changed(self, slider_value: int) -> None:
+        """Mapuje pozycję suwaka na głębokość obiektu i aktualizuje opis działania."""
+        depth_ratio = max(0.0, min(1.0, float(slider_value) / 100.0))
+        # 0% = obiekt bliżej (mniejsze zmiany perspektywy), 100% = obiekt dalej (większe zmiany).
+        target_depth = -0.8 - (2.2 * depth_ratio)
+        self.viewport.set_object_depth(target_depth)
+        self.depth_value_label.setText(
+            f"Głębokość obiektu: {slider_value}% | Z = {target_depth:.2f}. "
+            "Bliżej: spokojniejsza perspektywa, dalej: mocniejsza paralaksa."
+        )
 
     def update_metrics(self, metrics: dict[str, Any]) -> None:
         self.viewport.update_from_metrics(metrics)
