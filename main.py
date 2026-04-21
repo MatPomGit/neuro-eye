@@ -14,12 +14,13 @@ project bootstrapping, the UI still starts with a safe fallback stub.
 from __future__ import annotations
 
 import sys
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QSizePolicy,
     QMessageBox,
     QPushButton,
     QStatusBar,
@@ -208,6 +210,90 @@ class VideoFrameLabel(QLabel):
         self._apply_scaled_pixmap()
 
 
+class TimeSeriesChart(QWidget):
+    """Prosty wykres liniowy przebiegu wartości X/Y w czasie."""
+
+    def __init__(
+        self,
+        title: str,
+        x_label: str = "X",
+        y_label: str = "Y",
+        max_points: int = 180,
+    ) -> None:
+        super().__init__()
+        # Bufor kołowy ogranicza zużycie pamięci przy długiej pracy aplikacji.
+        self._title = title
+        self._x_label = x_label
+        self._y_label = y_label
+        self._x_values: deque[float] = deque(maxlen=max_points)
+        self._y_values: deque[float] = deque(maxlen=max_points)
+        self.setMinimumHeight(170)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def clear_series(self) -> None:
+        """Czyści historię wykresu, np. po zatrzymaniu śledzenia."""
+        self._x_values.clear()
+        self._y_values.clear()
+        self.update()
+
+    def append_sample(self, x_value: float, y_value: float) -> None:
+        """Dodaje nową próbkę X/Y do wykresu czasowego."""
+        self._x_values.append(float(x_value))
+        self._y_values.append(float(y_value))
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        """Rysuje osie oraz dwie serie czasowe (X i Y)."""
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0B1220"))
+
+        chart_rect = self.rect().adjusted(10, 26, -10, -18)
+        if chart_rect.width() <= 0 or chart_rect.height() <= 0:
+            return
+
+        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.drawRect(chart_rect)
+
+        painter.setPen(QColor("#CBD5E1"))
+        painter.drawText(chart_rect.left(), chart_rect.top() - 8, self._title)
+
+        if len(self._x_values) < 2:
+            painter.setPen(QColor("#94A3B8"))
+            painter.drawText(chart_rect.adjusted(8, 8, -8, -8), Qt.AlignmentFlag.AlignCenter, "Brak danych")
+            return
+
+        points_x = self._series_to_points(self._x_values, chart_rect)
+        points_y = self._series_to_points(self._y_values, chart_rect)
+
+        painter.setPen(QPen(QColor("#38BDF8"), 2))
+        for i in range(1, len(points_x)):
+            painter.drawLine(points_x[i - 1], points_x[i])
+        painter.setPen(QPen(QColor("#F97316"), 2))
+        for i in range(1, len(points_y)):
+            painter.drawLine(points_y[i - 1], points_y[i])
+
+        painter.setPen(QColor("#E2E8F0"))
+        painter.drawText(chart_rect.left() + 8, chart_rect.bottom() - 4, self._x_label)
+        painter.drawText(chart_rect.left() + 56, chart_rect.bottom() - 4, self._y_label)
+
+    @staticmethod
+    def _series_to_points(series: deque[float], rect: Any) -> list[QPointF]:
+        """Mapuje wartości z zakresu [0, 1] do punktów w obszarze rysowania."""
+        count = len(series)
+        if count < 2:
+            return []
+        step = rect.width() / max(count - 1, 1)
+        result: list[QPointF] = []
+        for index, value in enumerate(series):
+            clamped = max(0.0, min(1.0, float(value)))
+            x_pos = rect.left() + index * step
+            y_pos = rect.bottom() - clamped * rect.height()
+            result.append(QPointF(x_pos, y_pos))
+        return result
+
+
 class LiveTrackingTab(QWidget):
     """Primary live tracking workspace with video and telemetry panel."""
 
@@ -217,6 +303,16 @@ class LiveTrackingTab(QWidget):
         super().__init__()
         self.snapshot = TrackingSnapshot()
         self.video_label = VideoFrameLabel()
+        self.eye_position_chart = TimeSeriesChart(
+            "Pozycja oczu na obrazie (znormalizowana)",
+            x_label="X (cyjan)",
+            y_label="Y (pomarańcz)",
+        )
+        self.gaze_focus_chart = TimeSeriesChart(
+            "Punkt skupienia wzroku na ekranie (znormalizowany)",
+            x_label="Gaze X (cyjan)",
+            y_label="Gaze Y (pomarańcz)",
+        )
         self.start_button = QPushButton("Start Tracking")
         self.stop_button = QPushButton("Stop")
         self.status_value = QLabel("Idle")
@@ -238,6 +334,8 @@ class LiveTrackingTab(QWidget):
 
         left_panel = QVBoxLayout()
         left_panel.addWidget(self.video_label, stretch=1)
+        left_panel.addWidget(self.eye_position_chart, stretch=0)
+        left_panel.addWidget(self.gaze_focus_chart, stretch=0)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.start_button)
@@ -251,6 +349,9 @@ class LiveTrackingTab(QWidget):
     def _build_metrics_panel(self) -> QWidget:
         panel = QGroupBox("Live Parameters")
         layout = QFormLayout(panel)
+        # Długi status z backendu nie może rozszerzać całego okna aplikacji.
+        self.status_value.setWordWrap(True)
+        self.status_value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addRow("Tracker Status", self.status_value)
         layout.addRow("Gaze X", self.gaze_x_value)
         layout.addRow("Gaze Y", self.gaze_y_value)
@@ -264,6 +365,10 @@ class LiveTrackingTab(QWidget):
         self.start_button.setEnabled(not is_running)
         self.stop_button.setEnabled(is_running)
         self.status_value.setText("Running" if is_running else "Idle")
+        if not is_running:
+            # Po zatrzymaniu sesji czyścimy wykresy, aby nie mieszać przebiegów.
+            self.eye_position_chart.clear_series()
+            self.gaze_focus_chart.clear_series()
 
     def update_status(self, status: str) -> None:
         self.status_value.setText(status)
@@ -286,6 +391,17 @@ class LiveTrackingTab(QWidget):
         self.blink_rate_value.setText(f"{self.snapshot.blink_rate:.2f} blinks/min")
         self.blink_flag_value.setText("Yes" if self.snapshot.blink_detected else "No")
         self.tracking_flag_value.setText("Yes" if self.snapshot.tracking_ready else "No")
+
+        # Przybliżona pozycja oczu na obrazie z cech kalibracyjnych (średnia lewe/prawe oko).
+        raw_features = metrics.get("raw_feature_vector", [])
+        if isinstance(raw_features, list) and len(raw_features) >= 4:
+            eye_x = (float(raw_features[0]) + float(raw_features[2])) / 2.0
+            eye_y = (float(raw_features[1]) + float(raw_features[3])) / 2.0
+            self.eye_position_chart.append_sample(eye_x, eye_y)
+
+        # Wykres punktu skupienia wzroku dodajemy tylko dla poprawnej estymacji.
+        if self.snapshot.tracking_ready:
+            self.gaze_focus_chart.append_sample(self.snapshot.gaze_x, self.snapshot.gaze_y)
 
 
 class CalibrationPreview(QWidget):
