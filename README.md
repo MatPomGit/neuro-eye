@@ -1,5 +1,10 @@
 # Eye Tracking Research App
 
+## Publication policy
+
+For research papers derived from this project, follow the [submission-first publication policy](RESEARCH.md): prepare scientifically defensible, completed manuscripts for prompt author-approved submission rather than indefinite postponement. Scientific integrity, ethics, and the author's approval remain mandatory.
+
+
 ## Important MediaPipe note
 
 This project uses the classic **Face Mesh / Iris landmarks** API. It requires a MediaPipe build that exposes the **solutions** interface.
